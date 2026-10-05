@@ -397,8 +397,11 @@ def build_report(fwd, sol, loo, seeds, sens, diag, N, seed) -> str:
     sn = sn[["parameter", "value", "primary", "P(E<W) %", "E_median"]]
     sn.columns = ["Parameter varied", "Value", "Primary", "P(E<W) %", "E median"]
     mm = mode_frac_matching_v1_mean()
-    assume_rows = "\n".join(f"| {k} | {v} | {PROVENANCE.get(k, PROVENANCE.get(k.split('_')[0], ''))} |"
-                            for k, v in ASSUME.items())
+    def _prov(k):
+        if k in PROVENANCE:
+            return PROVENANCE[k]
+        return next((p for pk, p in PROVENANCE.items() if "/" in pk and k.startswith(pk.split("_")[0] + "_")), "")
+    assume_rows = "\n".join(f"| {k} | {v} | {_prov(k)} |" for k, v in ASSUME.items())
     return f"""# Project AURUM — Ablation study (V1.0 → V2.0)
 
 *Generated {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')} · N = {N:,} draws per configuration · seed {seed} · engine {E2.ENGINE_VERSION}*
