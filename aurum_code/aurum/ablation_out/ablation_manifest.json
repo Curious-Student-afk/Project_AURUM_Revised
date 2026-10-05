@@ -1,0 +1,49 @@
+{
+  "engine_version": "2.0.0-draft",
+  "n": 500000,
+  "seed": 42,
+  "benchmark": {
+    "H": 8.0,
+    "T": 0.85,
+    "Cfamily": 44.8,
+    "W": 65.63,
+    "Cfixed": 80.0,
+    "delta": 1.1,
+    "Cfuel": 160.0,
+    "alpha": 0.02,
+    "eta": 0.95,
+    "Gmin": 0.33,
+    "Gsub": 1.45,
+    "Gjack": 19.47,
+    "Pmin": 7282.35,
+    "Pmax": 8900.65
+  },
+  "assumptions": {
+    "n_c": 5,
+    "s_group": 0.658,
+    "p0": 0.1,
+    "pi_J": 0.01,
+    "jack_threshold": 14.4,
+    "jack_cap": 24.0,
+    "jack_shape": 1.5,
+    "mode_frac": 0.4,
+    "price_mode_frac": 0.5,
+    "cost_lo": 0.8,
+    "cost_hi": 1.2,
+    "rho": 0.5
+  },
+  "provenance": {
+    "n_c": "assumed",
+    "s_group": "pilot",
+    "p0": "assumed",
+    "pi_J": "assumed",
+    "jack_threshold/cap": "pilot (n=3 respondents)",
+    "jack_shape": "assumed",
+    "mode_frac": "assumed",
+    "price_mode_frac": "assumed",
+    "cost_lo/cost_hi": "assumed",
+    "rho": "assumed"
+  },
+  "created_utc": "2026-10-04T07:54:22+00:00",
+  "numpy": "2.4.4"
+}
