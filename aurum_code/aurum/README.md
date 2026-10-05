@@ -15,7 +15,7 @@
 | `tests/test_dashboard.py`, `tests/fake_streamlit.py` | Dashboard logic tests plus an offline smoke test of `app.py` against a fake Streamlit. |
 | `requirements.txt` | numpy, scipy, pandas, matplotlib, streamlit. |
 
-## Run (offline, Python 3.11+, needs numpy, scipy, pandas)
+## Run (offline, Python 3.11+, needs numpy, scipy, pandas, matplotlib, streamlit)
 ```
 python -m unittest discover -s tests -v
 python run_demo.py
