@@ -359,8 +359,22 @@ def validate(inp: Inputs) -> List[str]:
             errs.append("Purity q must satisfy 0 < q <= 1 (karat / 24 if given in karats).")
 
     # costs
+    cost_items = list(inp.costs)
+    for eq in inp.equipment:
+        eq_errs = []
+        eq.check(eq_errs)
+        errs.extend(eq_errs)
+        fixed = 0.0 if eq_errs else eq.cost_per_cycle(inp.D_c)
+        cost_items.append(
+            CostItem(
+                name=f"equipment:{eq.name}",
+                miner_share=eq.miner_share,
+                fixed=fixed,
+            )
+        )
+
     names = set()
-    for c in inp.all_cost_items():
+    for c in cost_items:
         if c.name in names:
             errs.append(f"Cost '{c.name}' appears twice (each cost must appear exactly once).")
         names.add(c.name)
@@ -372,11 +386,9 @@ def validate(inp: Inputs) -> List[str]:
             errs.append(f"Cost '{c.name}': must be >= 0 PHP per cycle.")
         if c.pert is not None:
             c.pert.check(f"Cost '{c.name}'", errs)
-    for eq in inp.equipment:
-        eq.check(errs)
 
     # dependence
-    sto = inp.stochastic_cost_items()
+    sto = [c for c in inp.costs if c.pert is not None]
     if inp.dependence not in ("copula", "independent"):
         errs.append("dependence must be 'copula' or 'independent'.")
     if inp.dependence == "copula" and len(sto) > 1:
