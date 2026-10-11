@@ -225,6 +225,7 @@ class TestAccounting(unittest.TestCase):
         self.assertEqual(inp.person_hours(), 46)
 
     def test_household_requirement(self):
+        """Household requirement scales with calendar days and is floored at zero net need."""
         b = base(n_c=4, D_c=2, calendar_days_per_cycle=2, hh_need_per_household_day=1000, nonmining_income_per_household_day=200)
         self.assertEqual(b.household_requirement(), 4 * 2 * 800)
         b2 = base(hh_need_per_household_day=100, nonmining_income_per_household_day=500)

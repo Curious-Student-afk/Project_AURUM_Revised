@@ -202,6 +202,7 @@ class TestAppSmoke(unittest.TestCase):
         self.assertEqual(f2.calls("metric"), [])
 
     def test_scenario_grid_button_populates_tables(self):
+        """Running the scenario grid populates the overview, convergence and grid dataframes."""
         f1, _ = run_app(overrides={"n_max": 50_000}, submit=True)
         f2, _ = run_app(submit=False, press={"Run scenario grid"}, session_state=f1.session_state)
         self.assertEqual(len(f2.calls("dataframe")), 3 + 2 + 1)      # overview 3, convergence 1, grid 2

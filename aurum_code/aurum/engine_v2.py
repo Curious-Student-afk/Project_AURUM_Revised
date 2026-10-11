@@ -81,6 +81,7 @@ def finite_number(value) -> bool:
 
 
 def require_finite(name: str, value, errs: List[str]) -> bool:
+    """Append an error for `name` if `value` is not a finite real number; return whether it passed."""
     if not finite_number(value):
         errs.append(f"{name}: must be a finite real number (not a boolean).")
         return False
@@ -88,6 +89,7 @@ def require_finite(name: str, value, errs: List[str]) -> bool:
 
 
 def require_integer(name: str, value, minimum: int, errs: List[str]) -> bool:
+    """Append an error for `name` if `value` is not an int >= minimum; return whether it passed."""
     if isinstance(value, (bool, np.bool_)) or not isinstance(value, (int, np.integer)) or value < minimum:
         errs.append(f"{name}: must be an integer >= {minimum} (not a boolean).")
         return False
@@ -95,11 +97,13 @@ def require_integer(name: str, value, minimum: int, errs: List[str]) -> bool:
 
 
 def _raise_errors(errs: List[str]) -> None:
+    """Raise InputError with the collected messages, if any."""
     if errs:
         raise InputError("\n".join(f"- {e}" for e in errs))
 
 
 def _finite_array(name, value) -> np.ndarray:
+    """Coerce `value` to a float ndarray, raising InputError if any element isn't finite."""
     try:
         a = np.asarray(value, dtype=object)
         if not all(finite_number(x) for x in a.flat):
@@ -144,6 +148,7 @@ class PERT:
 
     def check(self, name: str, errs: List[str], strictly_positive: bool = False,
               upper: Optional[float] = None) -> None:
+        """Append validation errors for this PERT's parameters (ordering, sign, upper bound)."""
         valid = [require_finite(f"{name}.{key}", getattr(self, key), errs) for key in ("a", "m", "b")]
         if not all(valid):
             return
@@ -242,6 +247,7 @@ class EquipmentItem:
         raise InputError(f"Equipment '{self.name}': mode must be 'purchased' or 'rented'.")
 
     def check(self, errs: List[str]) -> None:
+        """Append validation errors for this equipment item's mode-specific fields."""
         n = f"Equipment '{self.name}'"
         if self.mode not in ("purchased", "rented"):
             errs.append(f"{n}: mode must be 'purchased' or 'rented'.")
@@ -323,6 +329,7 @@ class Inputs:
         return float(self.n_c * self.D_c * self.hours_per_worker_shift)
 
     def calendar_days(self) -> float:
+        """Calendar days covered by the cycle, falling back to one day per shift if unset."""
         return float(self.D_c if self.calendar_days_per_cycle is None else self.calendar_days_per_cycle)
 
     def household_requirement(self) -> float:
@@ -683,6 +690,7 @@ def risk_band(p_meet_benchmark: float, low_cut: float = 0.67, mod_cut: float = 0
 
 
 def _prob_counts(a: Dict[str, np.ndarray], W_opp: float, B_HH: float) -> Dict[str, int]:
+    """Count, per risk probability key, how many simulated cycles trigger the event."""
     events = {
         "P_negative_operating_return": a["Pi"] < 0,
         "P_labor_return_below_wage": a["E"] < W_opp,
@@ -715,6 +723,7 @@ def expected_shortfall(values: np.ndarray, fraction: float = 0.05) -> float:
 
 
 def _validate_run_options(seed, batch_size, n_min, n_max, tol, n_fixed, sens_rows):
+    """Raise InputError if any run() configuration option has an invalid type or range."""
     errs = []
     for name, value, minimum in (("seed", seed, 0), ("batch_size", batch_size, 1),
                                   ("n_min", n_min, 1), ("n_max", n_max, 1), ("sens_rows", sens_rows, 2)):
@@ -872,6 +881,7 @@ def _jsonable(o):
 
 
 def build_manifest(inp: Inputs, **cfg) -> Dict[str, object]:
+    """Build the reproducibility manifest: code/input hashes, resolved calendar days, accounting basis, run config."""
     inputs_json = json.dumps(_jsonable(inp), sort_keys=True, default=str)
     code_hash = "unavailable"            # stays so if the code was pasted into a notebook cell (no __file__)
     src = globals().get("__file__")

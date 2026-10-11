@@ -192,6 +192,7 @@ def v2_form(preset: str) -> tuple:
 # V2.0 results
 # ------------------------------------------------------------------------------------------------
 def render_v2(state: dict) -> None:
+    """Render the V2.0 results tabs (overview, distributions, convergence, scenario, export, about)."""
     inp, res, tags = state["inp"], state["res"], state["tags"]
     s = res.summary
     assumed = DL.assumed_inputs(tags)

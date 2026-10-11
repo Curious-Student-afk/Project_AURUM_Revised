@@ -80,6 +80,7 @@ def param_tags(preset: str) -> Dict[str, str]:
 # Inputs <-> flat UI values
 # --------------------------------------------------------------------------------------
 def values_from_inputs(inp: E2.Inputs) -> Dict[str, object]:
+    """Convert engine Inputs back into the flat UI values dict used by the form."""
     cost = {c.name: c for c in inp.costs}
     fx, fu, tr = cost["fixed_operating"], cost["fuel"], cost["transport_hauling"]
     y = inp.yield_ord
@@ -215,6 +216,7 @@ def build_inputs(v: Dict[str, object], preset: Optional[str] = None) -> E2.Input
 
 
 def run_v2(v: Dict[str, object], preset: Optional[str] = None) -> Tuple[E2.Inputs, E2.Result]:
+    """Build engine Inputs from UI values and run the V2 simulation."""
     inp = build_inputs(v, preset)
     res = E2.run(inp, seed=v["seed"], tol=v["tol"], n_max=v["n_max"])
     return inp, res
@@ -224,6 +226,7 @@ def run_v2(v: Dict[str, object], preset: Optional[str] = None) -> Tuple[E2.Input
 # Text: interpretation and messages (neutral, no directive advice)
 # --------------------------------------------------------------------------------------
 def interpretation_text(res: E2.Result, inp: E2.Inputs, n_assumed: int) -> str:
+    """Build the plain-language interpretation paragraph for the overview tab."""
     s = res.summary
     p = s["P_labor_return_below_wage"]
     lines = [
@@ -306,6 +309,7 @@ def return_table(res: E2.Result) -> pd.DataFrame:
 
 
 def cash_table(res: E2.Result) -> pd.DataFrame:
+    """Build the per-cycle cash and replacement-reserve summary table."""
     labels = {
         "cash_before_reserve": "Miner cash before reserve",
         "depreciation_miner": "Miner depreciation (economic cost only)",
@@ -378,6 +382,7 @@ def fig_yield_exceedance(Y: np.ndarray, thresholds: Dict[str, float]) -> plt.Fig
 
 
 def fig_stability(stage: pd.DataFrame) -> plt.Figure:
+    """Plot how the risk probabilities and their MCSE bounds stabilize as N grows."""
     fig, ax = plt.subplots(figsize=(7.5, 4.2))
     for k, c in zip(E2.PROB_KEYS, plt.get_cmap("tab10").colors):
         ax.errorbar(stage["N"], 100 * stage[k], yerr=200 * stage["MCSE_" + k], marker="o", capsize=3, color=c,
@@ -411,6 +416,7 @@ def fig_rank_sensitivity(rank: Dict[str, float]) -> plt.Figure:
 # Exports
 # --------------------------------------------------------------------------------------
 def export_csv(res: E2.Result, max_rows: int = 5_000) -> bytes:
+    """Export per-cycle simulation arrays, including cash and reserve fields, as CSV bytes."""
     a = res.arrays
     m = min(max_rows, len(a["E"]))
     df = pd.DataFrame({
