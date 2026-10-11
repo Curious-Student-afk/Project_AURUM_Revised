@@ -204,7 +204,7 @@ class TestAppSmoke(unittest.TestCase):
     def test_scenario_grid_button_populates_tables(self):
         f1, _ = run_app(overrides={"n_max": 50_000}, submit=True)
         f2, _ = run_app(submit=False, press={"Run scenario grid"}, session_state=f1.session_state)
-        self.assertEqual(len(f2.calls("dataframe")), 2 + 2 + 1)      # overview 2, convergence 1, grid 2
+        self.assertEqual(len(f2.calls("dataframe")), 3 + 2 + 1)      # overview 3, convergence 1, grid 2
 
     def test_legacy_mode_renders_with_warning_and_flaw_list(self):
         fake, stopped = run_app(overrides={"version": "V1.0 (legacy, frozen - comparison only)", "N": 10_000}, submit=True)

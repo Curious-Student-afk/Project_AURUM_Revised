@@ -59,6 +59,9 @@ def v2_form(preset: str) -> tuple:
                        min_value=1, max_value=100, value=int(d["n_c"]), step=1)
         v["D_c"] = num("D_c", "Shifts per cycle D_c", "The pilot data are per shift, so a cycle = 1 shift.",
                        min_value=1, max_value=60, value=int(d["D_c"]), step=1)
+        v["calendar_days"] = num("calendar_days", "Calendar days covered by this cycle",
+                                 "Household expense/income period, including idle days. Separate from working shifts.",
+                                 min_value=0.01, max_value=3650.0, value=float(d["calendar_days"]), step=0.25)
         v["h"] = num("h", "Hours per worker per shift", None, min_value=0.5, max_value=24.0,
                      value=float(d["h"]), step=0.25, format="%.2f")
 
@@ -150,6 +153,18 @@ def v2_form(preset: str) -> tuple:
         v["eq_share"] = num("eq_share", "Share paid by miners (equipment)", None, min_value=0.0, max_value=1.0,
                             value=float(d["eq_share"]), step=0.05, format="%.2f")
 
+        st.markdown("**Replacement reserve** (per cycle)")
+        v["reserve_mode"] = rad("reserve_mode", "Reserve target", ["none", "match_depreciation", "custom"],
+                                "None is the default. Matching depreciation is a savings target, not another economic expense.")
+        v["reserve_location"] = rad("reserve_location", "Reserve funded from",
+                                    ["choose", "before_sharing", "after_sharing"],
+                                    "Before: common fund from operation cash after cash costs. After: miner fund from allocated cash. Choose explicitly when enabled.")
+        v["reserve_priority"] = rad("reserve_priority", "When cash is insufficient",
+                                    ["choose", "household_first", "reserve_first"],
+                                    "Household-first protects modeled miner household needs; unfunded reserves are reported.")
+        v["reserve_custom"] = num("reserve_custom", "Custom reserve target (PHP/cycle, selected fund)",
+                                  min_value=0.0, max_value=100_000_000.0, value=float(d["reserve_custom"]), step=100.0)
+
         st.markdown("**7. Benchmarks** (normative thresholds)")
         v["W_opp"] = num("W_opp", "Opportunity-wage benchmark (PHP/person-hour)", "Cite the wage order below.",
                          min_value=0.01, max_value=5000.0, value=float(d["W_opp"]), step=1.0, format="%.2f")
@@ -196,22 +211,27 @@ def render_v2(state: dict) -> None:
             getattr(st, level)(text)
 
         st.subheader("Risk probabilities")
-        cols = st.columns(4)
-        for col, key in zip(cols, E2.PROB_KEYS):
-            with col:
-                st.metric(E2.LABELS[key], f"{s[key]:.1%}")
-                st.caption(f"± {2 * s['MCSE_' + key]:.2%} (2 MCSE)")
+        for offset in range(0, len(E2.PROB_KEYS), 4):
+            cols = st.columns(4)
+            for col, key in zip(cols, E2.PROB_KEYS[offset:offset + 4]):
+                with col:
+                    st.metric(E2.LABELS[key], f"{s[key]:.1%}")
+                    st.caption(f"± {2 * s['MCSE_' + key]:.2%} (2 MCSE)")
         st.markdown(DL.risk_band_text(res))
         st.caption(f"N = {s['N']:,} simulated cycles - convergence {'reached' if s['converged'] else 'NOT reached'} - "
-                   f"person-hours per cycle L = {s['L_person_hours']:.1f} - household requirement B_HH = {s['B_HH']:,.0f} PHP")
+                   f"calendar days = {s['calendar_days_per_cycle']:g} - person-hours per cycle L = {s['L_person_hours']:.1f} - household requirement B_HH = {s['B_HH']:,.0f} PHP")
 
         left, right = st.columns(2)
         with left:
-            st.subheader("Labor return per person-hour")
+            st.subheader("Economic return per person-hour")
             st.dataframe(DL.return_table(res))
         with right:
             st.subheader("Yield thresholds (kept separate)")
             st.dataframe(DL.thresholds_table(res))
+        st.subheader("Cash and equipment reserve")
+        st.caption("Amounts are per cycle. Reserve totals refer to the selected common or miner fund; "
+                   "the miner contribution is shown separately. No borrowing is assumed.")
+        st.dataframe(DL.cash_table(res))
         st.markdown(DL.interpretation_text(res, inp, len(assumed)))
 
     with tab_dist:
@@ -249,7 +269,10 @@ def render_v2(state: dict) -> None:
         g = st.session_state.get("v2_grid")
         if g and g["for"] == state["run_id"]:
             cols_show = ["p0", "mode_frac", "n_c", "P_negative_operating_return", "P_labor_return_below_wage",
-                         "P_fail_household_adequacy", "E_median"]
+                         "P_fail_household_adequacy", "E_median",
+                         "P_cash_before_reserve_below_household", "P_cash_after_reserve_below_household",
+                         "P_reserve_underfunded", "P_household_and_reserve_met",
+                         "cash_after_reserve_mean", "reserve_shortfall_mean"]
             st.markdown("**Zero-yield probability x yield mode**")
             st.dataframe(g["grid"][[c for c in cols_show if c in g["grid"].columns and c != "n_c"]].round(3))
             st.markdown("**Crew size**")

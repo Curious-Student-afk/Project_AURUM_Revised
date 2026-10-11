@@ -22,6 +22,7 @@ def pilot_provisional(mode_frac: float = 0.40) -> Inputs:
     a, b = 0.33, 1.45                                   # pilot: mean of typical min / typical max (provisional)
     return Inputs(
         n_c=5,                                          # assumed typical crew (not collected)
+        calendar_days_per_cycle=1.0,                    # explicit one-day expense period
         D_c=1,                                          # cycle = one shift for the pilot data
         hours_per_worker_shift=7.73,                    # pilot mean (n=20)
         s_m=0.658,                                      # pilot non-miner share 34.2% -> miner group share
@@ -43,7 +44,7 @@ def pilot_provisional(mode_frac: float = 0.40) -> Inputs:
         hh_need_per_household_day=1075.0,               # pilot data table mean (manuscript says 1,105: reconcile)
         nonmining_income_per_household_day=0.0,         # assumed (not collected)
         provenance={
-            "n_c": "assumed", "D_c": "pilot", "hours_per_worker_shift": "pilot", "s_m": "pilot",
+            "n_c": "assumed", "D_c": "pilot", "calendar_days_per_cycle": "assumed", "hours_per_worker_shift": "pilot", "s_m": "pilot",
             "tribute_base": "assumed", "yield_ord.a,b": "pilot (provisional)", "yield_ord.m": "assumed",
             "zero.p0": "assumed", "pi_J": "assumed", "jackpot.threshold,cap": "pilot (n=3)",
             "jackpot.shape": "assumed", "price": "pilot (mode = most frequent reported price)",

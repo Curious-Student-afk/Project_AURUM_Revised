@@ -28,7 +28,7 @@ import engine_v2 as E2  # noqa: E402
 import legacy_v1  # noqa: E402
 from scenarios import synthetic_profiles  # noqa: E402
 
-DASHBOARD_VERSION = "2.0.0-draft"
+DASHBOARD_VERSION = "2.1.0-draft"
 
 # --------------------------------------------------------------------------------------
 # Provenance tags
@@ -47,6 +47,8 @@ PRESETS = ["Pilot-provisional baseline", "Synthetic: High-Cost", "Synthetic: Low
 _PRESET_TO_PROFILE = {PRESETS[0]: "Baseline", PRESETS[1]: "High-Cost", PRESETS[2]: "Low-Purity"}
 
 _BASE_TAGS = {
+    "calendar_days": "assumed", "reserve_mode": "assumed", "reserve_location": "assumed",
+    "reserve_priority": "assumed", "reserve_custom": "assumed",
     "n_c": "assumed", "D_c": "pilot", "h": "pilot", "s_m": "pilot", "tribute_base": "assumed",
     "ya": "pilot", "yb": "pilot", "mode_pct": "assumed",
     "p0_mode": "assumed", "p0": "assumed", "z": "assumed", "n_obs": "assumed",
@@ -88,6 +90,9 @@ def values_from_inputs(inp: E2.Inputs) -> Dict[str, object]:
         pur = E2.PERT(0.80, 0.88, 0.93)               # unused on a farmgate basis; shown as a starting point
     rho = inp.rho_spearman[0][1] if inp.rho_spearman else 0.5
     return {
+        "calendar_days": inp.calendar_days(), "reserve_mode": inp.reserve_mode,
+        "reserve_location": inp.reserve_location or "choose", "reserve_priority": inp.reserve_priority or "choose",
+        "reserve_custom": inp.reserve_custom_per_cycle,
         "n_c": int(inp.n_c), "D_c": int(inp.D_c), "h": float(inp.hours_per_worker_shift),
         "s_m": float(inp.s_m), "tribute_base": inp.tribute_base,
         "ya": float(y.a), "yb": float(y.b),
@@ -136,9 +141,39 @@ def effective_tags(values: Dict[str, object], preset: str) -> Dict[str, str]:
 
 def build_inputs(v: Dict[str, object], preset: Optional[str] = None) -> E2.Inputs:
     """Flat UI values -> engine Inputs (validation happens in engine_v2.validate / run)."""
+    # Validate raw numeric values before conversion; int()/float() must not hide bad input.
+    numeric = ["h", "s_m", "ya", "yb", "mode_pct", "pi_J", "p_min", "p_mode", "p_max",
+               "fixed_cost", "fixed_share", "fuel_min", "fuel_mode", "fuel_max", "fuel_share",
+               "trans_min", "trans_mode", "trans_max", "trans_share", "W_opp", "hh_need", "nonmining"]
+    if "calendar_days" in v:
+        numeric.append("calendar_days")
+    if v["p0_mode"] == "fixed value":
+        numeric.append("p0")
+    if E2.finite_number(v["pi_J"]) and v["pi_J"] > 0:
+        numeric.extend(["jack_thr", "jack_cap", "jack_shape"])
+    if v["price_basis"] == "reference":
+        numeric.extend(["q_min", "q_mode", "q_max"])
+    if v["dependence"] == "copula":
+        numeric.append("rho")
+    if v["eq_mode"] == "purchased":
+        numeric.extend(["eq_acq", "eq_salv", "eq_life", "eq_util", "eq_share"])
+    elif v["eq_mode"] == "rented":
+        numeric.extend(["eq_rent", "eq_share"])
+    if v.get("reserve_mode") == "custom":
+        numeric.append("reserve_custom")
+    errs = []
+    for name in numeric:
+        E2.require_finite(name, v[name], errs)
+    for name, minimum in (("n_c", 1), ("D_c", 1), ("n_hh", 0)):
+        E2.require_integer(name, v[name], minimum, errs)
+    if v["p0_mode"] == "from counts":
+        for name in ("z", "n_obs"):
+            E2.require_integer(name, v[name], 0, errs)
+    if errs:
+        raise E2.InputError("\n".join(errs))
     pert = E2.PERT
     zero = (E2.ZeroYield(p0=float(v["p0"])) if v["p0_mode"] == "fixed value"
-            else E2.ZeroYield(z=int(v["z"]), n=int(v["n_obs"])))
+            else E2.ZeroYield(z=v["z"], n=v["n_obs"]))
     a, b = float(v["ya"]), float(v["yb"])
     y = pert(a, a + float(v["mode_pct"]) / 100.0 * (b - a), b)
     jack = (E2.Jackpot(float(v["jack_thr"]), float(v["jack_cap"]), float(v["jack_shape"]))
@@ -159,9 +194,14 @@ def build_inputs(v: Dict[str, object], preset: Optional[str] = None) -> E2.Input
     price_basis = str(v["price_basis"])
     price = pert(float(v["p_min"]), float(v["p_mode"]), float(v["p_max"]))
     purity = (pert(float(v["q_min"]), float(v["q_mode"]), float(v["q_max"])) if price_basis == "reference" else 1.0)
-    n_hh = int(v["n_hh"])
+    n_hh = v["n_hh"]
     return E2.Inputs(
-        n_c=int(v["n_c"]), D_c=int(v["D_c"]), hours_per_worker_shift=float(v["h"]),
+        n_c=v["n_c"], D_c=v["D_c"], hours_per_worker_shift=float(v["h"]),
+        calendar_days_per_cycle=v.get("calendar_days"),
+        reserve_mode=v.get("reserve_mode", "none"),
+        reserve_location=None if v.get("reserve_location", "choose") == "choose" else v["reserve_location"],
+        reserve_priority=None if v.get("reserve_priority", "choose") == "choose" else v["reserve_priority"],
+        reserve_custom_per_cycle=v.get("reserve_custom", 0.0),
         s_m=float(v["s_m"]), tribute_base=str(v["tribute_base"]),
         yield_ord=y, zero=zero, pi_J=float(v["pi_J"]), jackpot=jack,
         price_basis=price_basis, price=price, purity=purity,
@@ -176,7 +216,7 @@ def build_inputs(v: Dict[str, object], preset: Optional[str] = None) -> E2.Input
 
 def run_v2(v: Dict[str, object], preset: Optional[str] = None) -> Tuple[E2.Inputs, E2.Result]:
     inp = build_inputs(v, preset)
-    res = E2.run(inp, seed=int(v["seed"]), tol=float(v["tol"]), n_max=int(v["n_max"]))
+    res = E2.run(inp, seed=v["seed"], tol=v["tol"], n_max=v["n_max"])
     return inp, res
 
 
@@ -196,6 +236,13 @@ def interpretation_text(res: E2.Result, inp: E2.Inputs, n_assumed: int) -> str:
     if s["E_mean"] > s["E_median"] * 1.1:
         lines.append(f"The mean ({s['E_mean']:.1f}) is above the median ({s['E_median']:.1f}) because rare high-yield "
                      "cycles pull the average up; the median and percentiles describe a typical cycle better.")
+    lines.append("Profit and hourly returns include equipment depreciation. Household cash probabilities "
+                 "exclude depreciation and separately show the effect of funded replacement reserves.")
+    if inp.reserve_mode != "none":
+        lines.append(f"Reserve policy: {inp.reserve_location.replace('_', ' ')}, "
+                     f"{inp.reserve_priority.replace('_', ' ')}. Planned and funded amounts refer to the "
+                     f"{'common' if inp.reserve_location == 'before_sharing' else 'miner'} fund. "
+                     "This is a single-cycle allocation, with no accumulated balance or borrowing.")
     lines.append(f"These figures describe the simulated scenario defined by the inputs, **{n_assumed} of which are "
                  "assumptions**. They are not predictions for any real mining group and do not establish a poverty trap, "
                  "which would require a dynamic (multi-period) model.")
@@ -226,7 +273,7 @@ def risk_band_text(res: E2.Result) -> str:
 THRESHOLD_ROWS = [
     ("Operating break-even yield", "Y_BE", "Yield at which the miner group's profit is zero"),
     ("Opportunity-wage yield", "Y_W", "Yield at which the return equals the wage benchmark per person-hour"),
-    ("Household-adequacy yield", "Y_HH", "Yield at which profit covers the households' cash requirement for the cycle"),
+    ("Household yield (economic profit)", "Y_HH", "Yield at which economic profit, including depreciation, meets household needs; not a cash threshold"),
 ]
 
 
@@ -256,6 +303,21 @@ def return_table(res: E2.Result) -> pd.DataFrame:
         {"Statistic (PHP per person-hour)": "Expected shortfall (mean of worst 5%)",
          "Value": round(s["E_expected_shortfall_5pct"], 2)},
     ])
+
+
+def cash_table(res: E2.Result) -> pd.DataFrame:
+    labels = {
+        "cash_before_reserve": "Miner cash before reserve",
+        "depreciation_miner": "Miner depreciation (economic cost only)",
+        "reserve_planned": "Reserve planned (selected fund)",
+        "reserve_funded": "Reserve funded (selected fund)",
+        "reserve_shortfall": "Reserve shortfall (selected fund)",
+        "reserve_miner_contribution": "Miner cash allocated to reserve",
+        "cash_after_reserve": "Miner cash after reserve",
+    }
+    return pd.DataFrame([{"Measure (PHP/cycle)": label,
+                          "Mean": res.summary[f"{key}_mean"], "Median": res.summary[f"{key}_median"]}
+                         for key, label in labels.items()])
 
 
 def assumed_inputs(tags: Dict[str, str]) -> List[str]:
@@ -317,7 +379,7 @@ def fig_yield_exceedance(Y: np.ndarray, thresholds: Dict[str, float]) -> plt.Fig
 
 def fig_stability(stage: pd.DataFrame) -> plt.Figure:
     fig, ax = plt.subplots(figsize=(7.5, 4.2))
-    for k, c in zip(E2.PROB_KEYS, ["#c0392b", "#1f4e79", "#e65100", "#6f42c1"]):
+    for k, c in zip(E2.PROB_KEYS, plt.get_cmap("tab10").colors):
         ax.errorbar(stage["N"], 100 * stage[k], yerr=200 * stage["MCSE_" + k], marker="o", capsize=3, color=c,
                     label=E2.LABELS[k], lw=1.4)
     ax.set_xscale("log")
@@ -355,6 +417,10 @@ def export_csv(res: E2.Result, max_rows: int = 5_000) -> bytes:
         "cycle_id": np.arange(1, m + 1),
         "yield_g": a["Y"][:m], "purity_q": a["q"][:m], "price_php_per_g": a["P"][:m],
         "miner_costs_php": a["C_eff"][:m], "miner_profit_php": a["Pi"][:m],
+        "calendar_days_per_cycle": res.summary["calendar_days_per_cycle"],
+        **{f"{key}_php": a[key][:m] for key in ("cash_cost_total", "cash_cost_miner",
+           "depreciation_total", "depreciation_miner", "cash_before_reserve", "cash_after_reserve",
+           "reserve_planned", "reserve_funded", "reserve_shortfall", "reserve_miner_contribution")},
         "return_php_per_person_hour": a["E"][:m],
         "Y_breakeven_g": a["Y_BE"][:m], "Y_wage_g": a["Y_W"][:m], "Y_household_g": a["Y_HH"][:m],
     })
@@ -405,6 +471,16 @@ LEGACY_FLAWS_MD = """
 ABOUT_MD = """
 **What this dashboard is**
 A simulation tool that turns the inputs you enter into probabilities and yield thresholds for a single production cycle.
+
+**Accounting meanings**
+Profit and hourly return include purchased-equipment depreciation. Cash excludes depreciation;
+rentals remain cash expenses. Household yield is an economic-profit threshold. Separate probabilities
+show household cash shortfall before and after a reserve, reserve underfunding, and meeting both targets.
+Reserve amounts refer to the common fund before sharing or the miner fund after sharing, as selected.
+Common reserves use cash after operating expenses and reduce the revenue base available for sharing.
+Household-first protects only the modeled miner households; reserve-first may reduce their available cash.
+No reserve balance, borrowing, or equipment purchases are simulated. Calendar days include idle days
+within the period covered by this cycle; working shifts still determine labor and rentals.
 
 **What the results are**
 Scenario results under the stated inputs. Inputs marked 🟠 *assumed* were not collected in the pilot (crew size, costs,
