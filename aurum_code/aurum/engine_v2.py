@@ -44,26 +44,76 @@ import math
 import platform
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import Dict, List, Optional, Sequence, Union
+from typing import Dict, List, Optional, Sequence, Tuple, Union
 
 import numpy as np
 import pandas as pd
 import scipy
 from scipy import stats
 
-ENGINE_VERSION = "2.0.0-draft"
+ENGINE_VERSION = "2.1.0-draft"
 
 LABELS = {
     "P_negative_operating_return": "Probability of Negative Operating Return",
     "P_labor_return_below_wage": "Probability of Labor Return Below Wage Benchmark",
     "P_yield_below_breakeven": "Probability of Yield Below Operating Break-Even",
-    "P_fail_household_adequacy": "Probability of Failing Household-Adequacy Threshold",
+    "P_fail_household_adequacy": "Probability of Economic Profit Below Household Requirement",
+    "P_cash_before_reserve_below_household": "Probability of Cash Shortfall Before Reserve",
+    "P_cash_after_reserve_below_household": "Probability of Cash Shortfall After Reserve",
+    "P_reserve_underfunded": "Probability of Reserve Funding Shortfall",
+    "P_household_and_reserve_met": "Probability of Meeting Household and Reserve Targets",
 }
 PROB_KEYS = tuple(LABELS.keys())
 
 
 class InputError(ValueError):
     """Raised when inputs are impossible or ambiguous (expert report, Section 8)."""
+
+
+def finite_number(value) -> bool:
+    """Accept real numeric scalars only, never booleans, strings, NaN or infinity."""
+    if isinstance(value, (bool, np.bool_)) or not isinstance(value, (int, float, np.integer, np.floating)):
+        return False
+    try:
+        return math.isfinite(value)
+    except (OverflowError, TypeError, ValueError):
+        return False
+
+
+def require_finite(name: str, value, errs: List[str]) -> bool:
+    """Append an error for `name` if `value` is not a finite real number; return whether it passed."""
+    if not finite_number(value):
+        errs.append(f"{name}: must be a finite real number (not a boolean).")
+        return False
+    return True
+
+
+def require_integer(name: str, value, minimum: int, errs: List[str]) -> bool:
+    """Append an error for `name` if `value` is not an int >= minimum; return whether it passed."""
+    if isinstance(value, (bool, np.bool_)) or not isinstance(value, (int, np.integer)) or value < minimum:
+        errs.append(f"{name}: must be an integer >= {minimum} (not a boolean).")
+        return False
+    return True
+
+
+def _raise_errors(errs: List[str]) -> None:
+    """Raise InputError with the collected messages, if any."""
+    if errs:
+        raise InputError("\n".join(f"- {e}" for e in errs))
+
+
+def _finite_array(name, value) -> np.ndarray:
+    """Coerce `value` to a float ndarray, raising InputError if any element isn't finite."""
+    try:
+        a = np.asarray(value, dtype=object)
+        if not all(finite_number(x) for x in a.flat):
+            raise ValueError()
+        a = a.astype(float)
+        if not np.all(np.isfinite(a)):
+            raise ValueError()
+        return a
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise InputError(f"{name}: must contain only finite real numbers.") from exc
 
 
 # ----------------------------------------------------------------------------------------
@@ -98,6 +148,10 @@ class PERT:
 
     def check(self, name: str, errs: List[str], strictly_positive: bool = False,
               upper: Optional[float] = None) -> None:
+        """Append validation errors for this PERT's parameters (ordering, sign, upper bound)."""
+        valid = [require_finite(f"{name}.{key}", getattr(self, key), errs) for key in ("a", "m", "b")]
+        if not all(valid):
+            return
         if not (self.a <= self.m <= self.b):
             errs.append(f"{name}: PERT needs min <= mode <= max (got {self.a}, {self.m}, {self.b}).")
         if strictly_positive and self.a <= 0:
@@ -193,9 +247,14 @@ class EquipmentItem:
         raise InputError(f"Equipment '{self.name}': mode must be 'purchased' or 'rented'.")
 
     def check(self, errs: List[str]) -> None:
+        """Append validation errors for this equipment item's mode-specific fields."""
         n = f"Equipment '{self.name}'"
         if self.mode not in ("purchased", "rented"):
             errs.append(f"{n}: mode must be 'purchased' or 'rented'.")
+            return
+        fields = ("miner_share", "acquisition", "salvage", "life_cycles", "utilization") if self.mode == "purchased" else ("miner_share", "rental_rate_per_shift")
+        valid = [require_finite(f"{n}.{key}", getattr(self, key), errs) for key in fields]
+        if not all(valid):
             return
         if not (0 <= self.miner_share <= 1):
             errs.append(f"{n}: miner_share must be in [0, 1].")
@@ -221,6 +280,7 @@ class Inputs:
     # --- accounting unit / labour ---
     n_c: int                                  # active crew size
     D_c: int = 1                              # shifts in the cycle
+    calendar_days_per_cycle: Optional[float] = None  # legacy fallback: one day per shift
     hours_per_worker_shift: float = 8.0       # h
     hours_matrix: Optional[List[List[float]]] = None   # optional D_c x n_c matrix of hours worked
 
@@ -245,6 +305,12 @@ class Inputs:
     rho_spearman: Optional[List[List[float]]] = None  # over stochastic cost items, in order
     dependence: str = "copula"                # "copula" | "independent"
 
+    # --- per-cycle replacement reserve (no accumulated balance or borrowing) ---
+    reserve_mode: str = "none"                # none | match_depreciation | custom
+    reserve_location: Optional[str] = None    # before_sharing | after_sharing
+    reserve_priority: Optional[str] = None    # household_first | reserve_first
+    reserve_custom_per_cycle: float = 0.0
+
     # --- benchmarks ---
     W_opp: float                              # PHP per person-hour (opportunity wage)
     W_opp_source: str = ""
@@ -262,11 +328,21 @@ class Inputs:
             return float(np.sum(np.asarray(self.hours_matrix, dtype=float)))
         return float(self.n_c * self.D_c * self.hours_per_worker_shift)
 
+    def calendar_days(self) -> float:
+        """Calendar days covered by the cycle, falling back to one day per shift if unset."""
+        return float(self.D_c if self.calendar_days_per_cycle is None else self.calendar_days_per_cycle)
+
     def household_requirement(self) -> float:
         """B_HH: cash the miners' households still need from mining for the cycle (>= 0)."""
         nh = self.n_c if self.n_households is None else self.n_households
         per_day = max(0.0, self.hh_need_per_household_day - self.nonmining_income_per_household_day)
-        return float(nh * self.D_c * per_day)
+        return float(nh * self.calendar_days() * per_day)
+
+    def depreciation(self) -> Tuple[float, float]:
+        """Total and directly allocated miner depreciation, separate from cash costs."""
+        purchased = [eq for eq in self.equipment if eq.mode == "purchased"]
+        return (sum(eq.cost_per_cycle(self.D_c) for eq in purchased),
+                sum(eq.miner_share * eq.cost_per_cycle(self.D_c) for eq in purchased))
 
     def all_cost_items(self) -> List[CostItem]:
         items = list(self.costs)
@@ -294,6 +370,57 @@ def validate(inp: Inputs) -> List[str]:
     errs: List[str] = []
     warns: List[str] = []
 
+    # Check scalar types before ordering/arithmetic so malformed inputs raise InputError.
+    for name in ("s_m", "pi_J", "W_opp", "hh_need_per_household_day", "nonmining_income_per_household_day"):
+        require_finite(name, getattr(inp, name), errs)
+    require_integer("n_c", inp.n_c, 1, errs)
+    require_integer("D_c", inp.D_c, 1, errs)
+    if inp.n_households is not None:
+        require_integer("n_households", inp.n_households, 0, errs)
+    if inp.hours_matrix is None:
+        require_finite("hours_per_worker_shift", inp.hours_per_worker_shift, errs)
+    else:
+        try:
+            hm = _finite_array("hours_matrix", inp.hours_matrix)
+            if hm.shape != (inp.D_c, inp.n_c) or np.any(hm < 0):
+                errs.append("hours_matrix: must have shape (D_c, n_c) and nonnegative hours.")
+        except InputError as exc:
+            errs.append(str(exc))
+    if inp.calendar_days_per_cycle is None:
+        warns.append("calendar_days_per_cycle omitted: assuming one calendar day per shift.")
+    elif require_finite("calendar_days_per_cycle", inp.calendar_days_per_cycle, errs):
+        if inp.calendar_days_per_cycle <= 0:
+            errs.append("calendar_days_per_cycle: must be > 0.")
+    if not isinstance(inp.price, PERT):
+        require_finite("price", inp.price, errs)
+    if inp.price_basis == "reference" and not isinstance(inp.purity, PERT):
+        require_finite("purity", inp.purity, errs)
+    for c in inp.costs:
+        require_finite(f"Cost '{c.name}'.miner_share", c.miner_share, errs)
+        if c.fixed is not None:
+            require_finite(f"Cost '{c.name}'.fixed", c.fixed, errs)
+    if finite_number(inp.pi_J) and inp.pi_J > 0 and inp.jackpot is not None:
+        for name in ("threshold", "cap", "shape"):
+            require_finite(f"jackpot.{name}", getattr(inp.jackpot, name), errs)
+    if inp.zero.p0 is not None:
+        require_finite("zero.p0", inp.zero.p0, errs)
+    else:
+        require_integer("zero.z", inp.zero.z, 0, errs)
+        require_integer("zero.n", inp.zero.n, 0, errs)
+        require_finite("zero.prior_a", inp.zero.prior_a, errs)
+        require_finite("zero.prior_b", inp.zero.prior_b, errs)
+    if inp.reserve_mode not in ("none", "match_depreciation", "custom"):
+        errs.append("reserve_mode: choose none, match_depreciation or custom.")
+    if inp.reserve_mode != "none":
+        if inp.reserve_location not in ("before_sharing", "after_sharing"):
+            errs.append("reserve_location: explicitly choose before_sharing or after_sharing.")
+        if inp.reserve_priority not in ("household_first", "reserve_first"):
+            errs.append("reserve_priority: explicitly choose household_first or reserve_first.")
+    if inp.reserve_mode == "custom" and require_finite("reserve_custom_per_cycle", inp.reserve_custom_per_cycle, errs):
+        if inp.reserve_custom_per_cycle < 0:
+            errs.append("reserve_custom_per_cycle: must be >= 0.")
+    _raise_errors(errs)
+
     # crew, labour
     if not isinstance(inp.n_c, (int, np.integer)) or inp.n_c < 1:
         errs.append("n_c: crew size must be an integer >= 1 (active contributors only).")
@@ -306,7 +433,7 @@ def validate(inp: Inputs) -> List[str]:
     elif inp.hours_per_worker_shift <= 0:
         errs.append("hours_per_worker_shift must be > 0.")
     try:
-        if inp.person_hours() <= 0:
+        if not finite_number(inp.person_hours()) or inp.person_hours() <= 0:
             errs.append("Person-hours L must be > 0 (cannot be replaced by shift duration alone).")
     except Exception:
         errs.append("Person-hours L could not be computed from the labour inputs.")
@@ -396,7 +523,7 @@ def validate(inp: Inputs) -> List[str]:
             errs.append("copula dependence needs rho_spearman for the stochastic costs "
                         "(or set dependence='independent').")
         else:
-            r = np.asarray(inp.rho_spearman, dtype=float)
+            r = _finite_array("rho_spearman", inp.rho_spearman)
             if r.shape != (len(sto), len(sto)):
                 errs.append(f"rho_spearman must be {len(sto)}x{len(sto)} (one row per stochastic cost).")
             elif (not np.allclose(r, r.T)) or np.any(np.abs(r) > 1) or not np.allclose(np.diag(r), 1):
@@ -415,8 +542,17 @@ def validate(inp: Inputs) -> List[str]:
     if inp.n_households is not None and inp.n_households < 0:
         errs.append("n_households must be >= 0.")
 
-    if errs:
-        raise InputError("\n".join(f"- {e}" for e in errs))
+    _raise_errors(errs)
+    try:
+        derived = (inp.household_requirement(), *inp.depreciation(),
+                   *(eq.cost_per_cycle(inp.D_c) for eq in inp.equipment))
+        if not all(finite_number(x) for x in derived):
+            raise ValueError()
+        if inp.zero.p0 is None and not all(finite_number(x) for x in
+                (inp.zero.prior_a + inp.zero.z, inp.zero.prior_b + inp.zero.n - inp.zero.z)):
+            raise ValueError()
+    except (OverflowError, ValueError, ZeroDivisionError) as exc:
+        raise InputError("Derived household, equipment or zero-yield parameters exceed finite numeric limits.") from exc
     return warns
 
 
@@ -482,7 +618,11 @@ def sample_batch(inp: Inputs, rng: np.random.Generator, size: int,
 # Accounting kernel (stakeholder cash flow + three thresholds)
 # ----------------------------------------------------------------------------------------
 def accounting_kernel(Y, q, P, C_m, C_tot, *, s_m: float, L: float, W_opp: float,
-                      B_HH: float, tribute_base: str = "gross") -> Dict[str, np.ndarray]:
+                      B_HH: float, tribute_base: str = "gross",
+                      depreciation_total: float = 0.0, depreciation_miner: float = 0.0,
+                      reserve_mode: str = "none", reserve_location: Optional[str] = None,
+                      reserve_priority: Optional[str] = None,
+                      reserve_custom_per_cycle: float = 0.0) -> Dict[str, np.ndarray]:
     """Vectorised, unit-checked accounting. Inputs are arrays per cycle (group level)."""
     F = Y * q                                  # fine-gold equivalent (g)
     R = F * P                                  # gross revenue (PHP)
@@ -491,7 +631,39 @@ def accounting_kernel(Y, q, P, C_m, C_tot, *, s_m: float, L: float, W_opp: float
     Pi = Rm - C_eff                            # miner-group profit (PHP)
     E = Pi / L                                 # PHP per person-hour
     unit_rev = q * P * s_m                     # PHP per gram of recovered gold, after the share
+    # Economic costs above include depreciation; cash costs below do not.
+    dep_eff = depreciation_miner if tribute_base == "gross" else s_m * depreciation_total
+    cash_cost_total = C_tot - depreciation_total
+    cash_cost_miner = C_m - depreciation_miner
+    cash_cost_eff = cash_cost_miner if tribute_base == "gross" else s_m * cash_cost_total
+    cash_before = Rm - cash_cost_eff
+    target = 0.0
+    if reserve_mode == "match_depreciation":
+        target = depreciation_total if reserve_location == "before_sharing" else dep_eff
+    elif reserve_mode == "custom":
+        target = reserve_custom_per_cycle
+    common = reserve_location == "before_sharing"
+    burden = s_m if common else 1.0
+    available = np.maximum(R - cash_cost_total if common else cash_before, 0.0)
+    if reserve_priority == "household_first":
+        available = np.minimum(available, np.maximum((cash_before - B_HH) / burden, 0.0))
+    planned = np.full_like(R, target, dtype=float)
+    funded = np.minimum(planned, available)
+    miner_contribution = burden * funded
+    cash_after = cash_before - miner_contribution
+    if reserve_priority == "household_first":
+        # Preserve the protected amount explicitly: subtracting nearly equal large
+        # values can otherwise put cash a few ulps below B_HH and count a false failure.
+        protected = np.minimum(cash_before, B_HH)
+        surplus = np.maximum(cash_before - B_HH, 0.0)
+        cash_after = np.where(funded > 0, protected + np.maximum(surplus - miner_contribution, 0.0), cash_before)
     return {
+        "cash_cost_total": cash_cost_total, "cash_cost_miner": cash_cost_eff,
+        "depreciation_total": np.full_like(R, depreciation_total, dtype=float),
+        "depreciation_miner": np.full_like(R, dep_eff, dtype=float),
+        "cash_before_reserve": cash_before, "cash_after_reserve": cash_after,
+        "reserve_planned": planned, "reserve_funded": funded,
+        "reserve_shortfall": planned - funded, "reserve_miner_contribution": miner_contribution,
         "F": F, "R": R, "Rm": Rm, "C_eff": C_eff, "Pi": Pi, "E": E,
         "Y_BE": C_eff / unit_rev,
         "Y_W": (C_eff + W_opp * L) / unit_rev,
@@ -517,13 +689,51 @@ def risk_band(p_meet_benchmark: float, low_cut: float = 0.67, mod_cut: float = 0
     return "high"
 
 
-def _prob_counts(pi, E, y, y_be, y_hh, W_opp, B_HH) -> Dict[str, int]:
-    return {
-        "P_negative_operating_return": int(np.count_nonzero(pi < 0)),
-        "P_labor_return_below_wage": int(np.count_nonzero(E < W_opp)),
-        "P_yield_below_breakeven": int(np.count_nonzero(y < y_be)),
-        "P_fail_household_adequacy": int(np.count_nonzero(pi < B_HH)),
+def _prob_counts(a: Dict[str, np.ndarray], W_opp: float, B_HH: float) -> Dict[str, int]:
+    """Count, per risk probability key, how many simulated cycles trigger the event."""
+    events = {
+        "P_negative_operating_return": a["Pi"] < 0,
+        "P_labor_return_below_wage": a["E"] < W_opp,
+        "P_yield_below_breakeven": a["Y"] < a["Y_BE"],
+        "P_fail_household_adequacy": a["Pi"] < B_HH,
+        "P_cash_before_reserve_below_household": a["cash_before_reserve"] < B_HH,
+        "P_cash_after_reserve_below_household": a["cash_after_reserve"] < B_HH,
+        "P_reserve_underfunded": a["reserve_shortfall"] > 0,
+        "P_household_and_reserve_met": (a["cash_after_reserve"] >= B_HH) & (a["reserve_shortfall"] == 0),
     }
+    return {key: int(np.count_nonzero(event)) for key, event in events.items()}
+
+
+def expected_shortfall(values: np.ndarray, fraction: float = 0.05) -> float:
+    """Mean of exactly the lowest fraction of empirical mass, including boundary ties."""
+    a = _finite_array("expected_shortfall values", values)
+    if a.ndim != 1 or a.size == 0 or not finite_number(fraction) or not 0 < fraction <= 1:
+        raise InputError("expected_shortfall: need a nonempty 1-D sample and 0 < fraction <= 1.")
+    a = np.sort(a)
+    mass = fraction * a.size
+    whole = int(math.floor(mass))
+    remainder = mass - whole
+    # Divide before summing to avoid overflowing sums of otherwise finite returns.
+    value = float(np.sum(a[:whole] / mass))
+    if remainder > 0:
+        value += float(a[whole] * (remainder / mass))
+    if not finite_number(value):
+        raise InputError("expected_shortfall: arithmetic exceeded finite numeric limits.")
+    return value
+
+
+def _validate_run_options(seed, batch_size, n_min, n_max, tol, n_fixed, sens_rows):
+    """Raise InputError if any run() configuration option has an invalid type or range."""
+    errs = []
+    for name, value, minimum in (("seed", seed, 0), ("batch_size", batch_size, 1),
+                                  ("n_min", n_min, 1), ("n_max", n_max, 1), ("sens_rows", sens_rows, 2)):
+        require_integer(name, value, minimum, errs)
+    if n_fixed is not None:
+        require_integer("n_fixed", n_fixed, 1, errs)
+    if require_finite("tol", tol, errs) and not 0 < tol < 1:
+        errs.append("tol: must satisfy 0 < tol < 1.")
+    # n_max < n_min is allowed: return an explicitly non-converged capped run.
+    _raise_errors(errs)
 
 
 # ----------------------------------------------------------------------------------------
@@ -553,11 +763,13 @@ def run(inp: Inputs, *, seed: int = 42, batch_size: int = 5_000, n_min: int = 10
     Stopping rule: keep adding batches until MCSE <= tol for EVERY reported probability and
     N >= n_min, or until n_max (then converged = False). Pass n_fixed to run exactly N draws.
     """
+    _validate_run_options(seed, batch_size, n_min, n_max, tol, n_fixed, sens_rows)
     warns = validate(inp)
     rng = np.random.default_rng(seed)
     chol = _copula_chol(inp)
     L = inp.person_hours()
     B_HH = inp.household_requirement()
+    dep_total, dep_miner = inp.depreciation()
 
     chunks: List[Dict[str, np.ndarray]] = []
     counts = {k: 0 for k in PROB_KEYS}
@@ -568,11 +780,18 @@ def run(inp: Inputs, *, seed: int = 42, batch_size: int = 5_000, n_min: int = 10
         b = min(batch_size, target - N)
         d = sample_batch(inp, rng, b, chol)
         k = accounting_kernel(d["Y"], d["q"], d["P"], d["C_m"], d["C_tot"], s_m=inp.s_m, L=L,
-                              W_opp=inp.W_opp, B_HH=B_HH, tribute_base=inp.tribute_base)
+                              W_opp=inp.W_opp, B_HH=B_HH, tribute_base=inp.tribute_base,
+                              depreciation_total=dep_total, depreciation_miner=dep_miner,
+                              reserve_mode=inp.reserve_mode, reserve_location=inp.reserve_location,
+                              reserve_priority=inp.reserve_priority,
+                              reserve_custom_per_cycle=inp.reserve_custom_per_cycle)
         chunk = {**{n: d[n] for n in ("Y", "q", "P", "C_tot", "C_m", "p0")}, **k,
                  **{f"cost::{n}": a for n, a in d["costs"].items()}}
+        for name, values in chunk.items():
+            if not np.all(np.isfinite(values)):
+                raise InputError(f"Simulation produced non-finite {name}; check input magnitudes.")
         chunks.append(chunk)
-        c = _prob_counts(k["Pi"], k["E"], d["Y"], k["Y_BE"], k["Y_HH"], inp.W_opp, B_HH)
+        c = _prob_counts(chunk, inp.W_opp, B_HH)
         for key in PROB_KEYS:
             counts[key] += c[key]
         N += b
@@ -592,13 +811,13 @@ def run(inp: Inputs, *, seed: int = 42, batch_size: int = 5_000, n_min: int = 10
     # ---- summary ----
     probs = {key: counts[key] / N for key in PROB_KEYS}
     p5, p50, p95 = np.percentile(E, [5, 50, 95])
-    tail = E[E <= p5]
     summary: Dict[str, float] = {
         "N": N, "converged": converged, "L_person_hours": L, "B_HH": B_HH,
+        "calendar_days_per_cycle": inp.calendar_days(),
         **probs,
         **{f"MCSE_{key}": mcse_prob(counts[key], N) for key in PROB_KEYS},
         "E_mean": float(E.mean()), "E_median": float(p50), "E_P5": float(p5), "E_P95": float(p95),
-        "E_expected_shortfall_5pct": float(tail.mean()),
+        "E_expected_shortfall_5pct": expected_shortfall(E),
         "Pi_mean": float(Pi.mean()), "Pi_median": float(np.median(Pi)),
         "Y_BE_median": float(np.median(arr["Y_BE"])), "Y_W_median": float(np.median(arr["Y_W"])),
         "Y_HH_median": float(np.median(arr["Y_HH"])),
@@ -608,11 +827,17 @@ def run(inp: Inputs, *, seed: int = 42, batch_size: int = 5_000, n_min: int = 10
         "risk_band_vs_wage": risk_band(1.0 - probs["P_labor_return_below_wage"]),
     }
 
+    for name in ("cash_before_reserve", "cash_after_reserve", "reserve_planned", "reserve_funded",
+                 "reserve_shortfall", "reserve_miner_contribution", "depreciation_miner"):
+        summary[f"{name}_mean"] = float(arr[name].mean())
+        summary[f"{name}_median"] = float(np.median(arr[name]))
+    if any(not finite_number(v) for v in summary.values() if not isinstance(v, (str, bool))):
+        raise InputError("Summary arithmetic exceeded finite numeric limits.")
+
     # ---- staged-N stability table ----
     rows = []
     for n_k in sorted(set([s for s in STAGES if s <= N] + [N])):
-        pk = {key: _prob_counts(Pi[:n_k], E[:n_k], arr["Y"][:n_k], arr["Y_BE"][:n_k],
-                                arr["Y_HH"][:n_k], inp.W_opp, B_HH)[key] for key in PROB_KEYS}
+        pk = _prob_counts({name: values[:n_k] for name, values in arr.items()}, inp.W_opp, B_HH)
         row = {"N": n_k, "E_mean": float(E[:n_k].mean()), "E_median": float(np.median(E[:n_k]))}
         for key in PROB_KEYS:
             row[key] = pk[key] / n_k
@@ -628,12 +853,12 @@ def run(inp: Inputs, *, seed: int = 42, batch_size: int = 5_000, n_min: int = 10
         if name.startswith("cost::"):
             candidates[name.replace("cost::", "cost_")] = a[:m]
     for name, a in candidates.items():
-        if np.ptp(a) > 0:
+        if m >= 2 and np.ptp(a) > 0 and np.ptp(E[:m]) > 0:
             sens[name] = float(stats.spearmanr(a, E[:m]).statistic)
     sens = dict(sorted(sens.items(), key=lambda kv: -abs(kv[1])))
 
     manifest = build_manifest(inp, seed=seed, batch_size=batch_size, n_min=n_min, n_max=n_max,
-                              tol=tol, n_fixed=n_fixed, N=N, converged=converged)
+                              tol=tol, n_fixed=n_fixed, sens_rows=sens_rows, N=N, converged=converged)
     return Result(summary=summary, stage_table=stage_table, rank_sensitivity=sens,
                   arrays=arr, manifest=manifest, warnings=warns)
 
@@ -656,6 +881,7 @@ def _jsonable(o):
 
 
 def build_manifest(inp: Inputs, **cfg) -> Dict[str, object]:
+    """Build the reproducibility manifest: code/input hashes, resolved calendar days, accounting basis, run config."""
     inputs_json = json.dumps(_jsonable(inp), sort_keys=True, default=str)
     code_hash = "unavailable"            # stays so if the code was pasted into a notebook cell (no __file__)
     src = globals().get("__file__")
@@ -671,6 +897,12 @@ def build_manifest(inp: Inputs, **cfg) -> Dict[str, object]:
         "inputs_sha256": hashlib.sha256(inputs_json.encode()).hexdigest(),
         "inputs": json.loads(inputs_json),
         "provenance": dict(inp.provenance),
+        "resolved_calendar_days_per_cycle": inp.calendar_days(),
+        "calendar_days_assumed_from_shifts": inp.calendar_days_per_cycle is None,
+        "accounting_basis": {"Pi": "economic_profit", "E": "economic_profit_per_person_hour",
+                             "Y_HH": "economic_profit_household_threshold",
+                             "reserve_amounts": "common_fund" if inp.reserve_location == "before_sharing" else "miner_fund",
+                             "reserve_horizon": "single_cycle_no_balance_or_borrowing"},
         "run_config": _jsonable(cfg),
         "python": platform.python_version(),
         "numpy": np.__version__,
@@ -716,6 +948,8 @@ def scenario_table(base: Inputs, *, p0: Optional[Sequence[float]] = None,
             "N": s["N"], "converged": s["converged"],
             **{k: s[k] for k in PROB_KEYS},
             "E_median": s["E_median"], "E_mean": s["E_mean"],
+            **{f"{name}_mean": s[f"{name}_mean"] for name in
+               ("cash_before_reserve", "cash_after_reserve", "reserve_planned", "reserve_funded", "reserve_shortfall")},
             "Y_BE_median": s["Y_BE_median"], "Y_W_median": s["Y_W_median"], "Y_HH_median": s["Y_HH_median"],
         })
     return pd.DataFrame(rows)
