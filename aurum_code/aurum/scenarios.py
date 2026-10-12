@@ -1,80 +1,57 @@
-"""
-scenarios.py -- named input sets for engine_v2.
-
-IMPORTANT: every value is tagged in `provenance`:
-    "pilot"     directly from the 21-interview pilot (non-representative convenience sample)
-    "external"  from a cited outside source (none yet -- add citations before using)
-    "assumed"   a placeholder the pilot did NOT collect; must be replaced or sensitivity-tested
-    "synthetic" invented for verification only
-
-Results from these scenarios are SCENARIO results. They are not findings about Pantukan miners.
-"""
+"""Independent synthetic demonstrations; no defaults represent measured mining conditions."""
 from __future__ import annotations
 
 import dataclasses
 from typing import Dict
+from engine_v2 import BatchTiming, CostItem, Inputs, Jackpot, PERT, ZeroYield
 
-from engine_v2 import CostItem, Inputs, Jackpot, PERT, ZeroYield
+
+def default_timing() -> BatchTiming:
+    return BatchTiming(PERT(2, 3, 5), PERT(0, 1, 3), (6, 3, 1),
+                       {1: PERT(6, 8, 10), 2: PERT(3, 4, 6), 3: PERT(2, 3, 4)})
 
 
-def pilot_provisional(mode_frac: float = 0.40) -> Inputs:
-    """Pilot-informed baseline. Crew size, costs, p0, pi_J, mode, dependence are ASSUMPTIONS."""
-    a, b = 0.33, 1.45                                   # pilot: mean of typical min / typical max (provisional)
+def fixed_synthetic(mode_frac: float = 1 / 3) -> Inputs:
+    """Small fixed-timing example for compatibility and regression verification."""
     return Inputs(
-        n_c=5,                                          # assumed typical crew (not collected)
-        calendar_days_per_cycle=1.0,                    # explicit one-day expense period
-        D_c=1,                                          # cycle = one shift for the pilot data
-        hours_per_worker_shift=7.73,                    # pilot mean (n=20)
-        s_m=0.658,                                      # pilot non-miner share 34.2% -> miner group share
-        tribute_base="gross",                           # assumed: revenue base was not asked
-        yield_ord=PERT(a, a + mode_frac * (b - a), b),  # mode is assumed
-        zero=ZeroYield(p0=0.10),                        # assumed (zero-yield counts not collected)
-        pi_J=0.01,                                      # assumed
-        jackpot=Jackpot(threshold=14.4, cap=24.0, shape=1.5),  # pilot range (n=3 respondents); shape assumed
-        price_basis="farmgate",
-        price=PERT(6050.0, 8400.0, 8400.0),             # pilot min / most frequent / max farmgate price
-        costs=[
-            CostItem("fixed_operating", miner_share=1.0, fixed=400.0),        # assumed (legacy default)
-            CostItem("fuel", miner_share=1.0, pert=PERT(600.0, 800.0, 1100.0)),       # assumed
-            CostItem("transport_hauling", miner_share=1.0, pert=PERT(100.0, 200.0, 400.0)),  # assumed
-        ],
-        rho_spearman=[[1.0, 0.5], [0.5, 1.0]],          # assumed fuel-transport dependence
-        dependence="copula",
-        W_opp=65.63,                                    # fill W_opp_source / W_opp_date before reporting
-        hh_need_per_household_day=1075.0,               # pilot data table mean (manuscript says 1,105: reconcile)
-        nonmining_income_per_household_day=0.0,         # assumed (not collected)
-        provenance={
-            "n_c": "assumed", "D_c": "pilot", "calendar_days_per_cycle": "assumed", "hours_per_worker_shift": "pilot", "s_m": "pilot",
-            "tribute_base": "assumed", "yield_ord.a,b": "pilot (provisional)", "yield_ord.m": "assumed",
-            "zero.p0": "assumed", "pi_J": "assumed", "jackpot.threshold,cap": "pilot (n=3)",
-            "jackpot.shape": "assumed", "price": "pilot (mode = most frequent reported price)",
-            "costs": "assumed", "rho_spearman": "assumed", "W_opp": "pilot/manuscript (source pending)",
-            "hh_need_per_household_day": "pilot", "nonmining_income": "assumed",
-        },
-    )
+        n_c=4, D_c=1, calendar_days_per_cycle=1., hours_per_worker_shift=8.,
+        s_m=.5, yield_ord=PERT(5, 5 + 15 * mode_frac, 20), zero=ZeroYield(p0=.1),
+        pi_J=.02, jackpot=Jackpot(30, 60, 1.5), price=PERT(5000, 5500, 6000),
+        costs=[CostItem('fixed_operating', fixed=500.),
+               CostItem('fuel', pert=PERT(600, 900, 1200)),
+               CostItem('transport_hauling', pert=PERT(200, 300, 400))],
+        rho_spearman=[[1., .5], [.5, 1.]], W_opp=100., hh_need_per_household_day=800.,
+        provenance={key: 'synthetic' for key in ('n_c', 's_m', 'yield_ord', 'zero', 'pi_J', 'jackpot',
+                    'price', 'costs', 'rho_spearman', 'W_opp', 'hh_need_per_household_day')})
+
+
+def batch_synthetic() -> Inputs:
+    inp = dataclasses.replace(fixed_synthetic(), batch_timing=default_timing(), calendar_days_per_cycle=None,
+        costs=[CostItem('fuel', pert=PERT(50, 75, 100), basis='per_operating_hour'),
+               CostItem('milling', pert=PERT(500, 750, 1000)),
+               CostItem('explosives', pert=PERT(100, 150, 200), basis='per_working_day'),
+               CostItem('transport', pert=PERT(200, 300, 400)),
+               CostItem('food', pert=PERT(100, 150, 200), basis='per_calendar_day')],
+        rho_spearman=[[float(i == j) for j in range(5)] for i in range(5)])
+    inp.provenance = {**inp.provenance, 'batch_timing': 'synthetic'}
+    return inp
 
 
 def _scale_costs(inp: Inputs, factor: float) -> Inputs:
-    new = []
-    for c in inp.costs:
-        if c.fixed is not None:
-            new.append(dataclasses.replace(c, fixed=c.fixed * factor))
-        else:
-            p = c.pert
-            new.append(dataclasses.replace(c, pert=PERT(p.a * factor, p.m * factor, p.b * factor)))
-    return dataclasses.replace(inp, costs=new)
+    costs = [dataclasses.replace(c, fixed=c.fixed * factor) if c.fixed is not None else
+             dataclasses.replace(c, pert=PERT(c.pert.a * factor, c.pert.m * factor, c.pert.b * factor))
+             for c in inp.costs]
+    return dataclasses.replace(inp, costs=costs)
 
 
 def synthetic_profiles() -> Dict[str, Inputs]:
-    """Chapter 3.4 test bench: Baseline, High-Cost, Low-Purity (verification only)."""
-    base = pilot_provisional()
-    high_cost = _scale_costs(base, 1.5)
-    high_cost.provenance = {**base.provenance, "costs": "synthetic (1.5x baseline)"}
-    low_purity = dataclasses.replace(
-        base,
-        price_basis="reference",
-        price=8400.0,                                   # quoted pure-gold reference price
-        purity=PERT(0.75, 0.82, 0.90),                  # synthetic low-purity dore
-        provenance={**base.provenance, "purity": "synthetic", "price": "synthetic (quoted reference)"},
-    )
-    return {"Baseline": base, "High-Cost": high_cost, "Low-Purity": low_purity}
+    base = batch_synthetic()
+    return {'Baseline': base, 'High-Cost': _scale_costs(base, 1.5),
+            'Low-Purity': dataclasses.replace(base, price_basis='reference', purity=PERT(.75, .85, .95))}
+
+
+def legacy_synthetic_values() -> dict:
+    """Independent illustrative inputs for exercising the unchanged V1 equations."""
+    return dict(H=8, T=.8, Cfamily=90., W=100., Cfixed=1200., delta=1.1,
+                Cfuel=800., alpha=.02, Gmin=5., Gsub=20., Gjack=60., eta=.9,
+                Pmin=5000., Pmax=6000., N=100_000)

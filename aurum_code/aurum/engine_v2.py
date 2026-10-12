@@ -1,12 +1,13 @@
 """
-engine_v2.py -- Project AURUM V2.0 zero-aware stochastic engine.
+engine_v2.py -- Project AURUM V2.2 batch stochastic engine.
 
 Pure NumPy/SciPy (no Streamlit), so it can be tested, run offline, and reused by any interface.
 
-ACCOUNTING UNIT: one processing cycle c (a cycle = D_c shifts). Every input is expressed
-per cycle at GROUP level, then converted to a per-person-hour return:
+ACCOUNTING UNIT: one complete production batch c, with optional daily schedules.
+Yield and revenue are per batch at GROUP level. Expense rates carry explicit units.
+Fixed-timing inputs remain available for equation comparisons:
 
-    F   = Y * q                         fine-gold equivalent (g)
+    F   = Y * q                         valuation mass (g); recovered mass for farmgate
     R   = F * P                         gross revenue (PHP)
     Pi  = s_m * R - C_m                 miner-group profit        (tribute_base = "gross")
     Pi  = s_m * (R - C_total)           miner-group profit        (tribute_base = "net")
@@ -29,10 +30,11 @@ PRICE-PURITY: handled exactly once.
     price_basis = "reference" -> price is the pure-gold reference price, q is applied
 
 ASSUMPTION FLAGS: every input can carry a provenance tag in Inputs.provenance
-("pilot", "external", "assumed", "synthetic") that is written to the run manifest.
+("external", "assumed", "synthetic", "user") that is written to the run manifest.
 
-Scope limit: dependence is modelled among cost categories only (Gaussian copula built from
-a Spearman matrix). Yield-cost dependence is NOT modelled (no data) -- state this as a limitation.
+Batch timing: whole active days plus nonnegative idle days; all crew attend daily schedules.
+Expense-rate dependence uses a Gaussian copula; explicit exposure scaling also links total
+costs to time. Batch yield is independent of timing and is never multiplied by shifts.
 """
 from __future__ import annotations
 
@@ -51,7 +53,7 @@ import pandas as pd
 import scipy
 from scipy import stats
 
-ENGINE_VERSION = "2.1.0-draft"
+ENGINE_VERSION = "2.2.0-draft"
 
 LABELS = {
     "P_negative_operating_return": "Probability of Negative Operating Return",
@@ -173,10 +175,57 @@ class PERT:
 
 
 @dataclass
+class BatchTiming:
+    """Daily crew schedules for one batch; all workers attend all scheduled shifts.
+
+    Working days use floor(PERT + .5); idle days are continuous. Daily counts and
+    conditional durations are independent across days and simulated batches.
+    """
+    work_days: PERT
+    idle_days: PERT
+    shift_counts: Tuple[int, int, int]
+    hours_by_shifts: Dict[int, PERT]
+
+    def check(self, errs: List[str]) -> None:
+        for name, p in (("work_days", self.work_days), ("idle_days", self.idle_days)):
+            if not isinstance(p, PERT):
+                errs.append(f"batch_timing.{name}: must be a PERT.")
+                continue
+            p.check(f"batch_timing.{name}", errs)
+            if name == "work_days":
+                for value in (p.a, p.m, p.b):
+                    if finite_number(value) and (value < 1 or value > 3650 or value != math.floor(value)):
+                        errs.append("work_days: bounds and mode must be whole days in [1, 3650].")
+        if not isinstance(self.shift_counts, (tuple, list)) or len(self.shift_counts) != 3:
+            errs.append("shift_counts: provide three counts for 1, 2, 3 shifts.")
+        else:
+            valid = [require_integer(f"shift_counts[{i}]", x, 0, errs)
+                     for i, x in enumerate(self.shift_counts)]
+            if all(valid) and sum(self.shift_counts) != 10:
+                errs.append("shift_counts: counts must sum to ten working days.")
+        if (not isinstance(self.hours_by_shifts, dict) or set(self.hours_by_shifts) != {1, 2, 3}
+                or any(isinstance(k, bool) for k in self.hours_by_shifts)):
+            errs.append("hours_by_shifts: supply PERT bounds keyed by 1, 2, 3 shifts.")
+        else:
+            for d, p in self.hours_by_shifts.items():
+                if not isinstance(p, PERT):
+                    errs.append(f"hours_by_shifts[{d}]: must be a PERT.")
+                    continue
+                p.check(f"hours_by_shifts[{d}]", errs, upper=min(16., 24. / d))
+                if finite_number(p.a) and p.a < .5:
+                    errs.append(f"hours_by_shifts[{d}]: minimum must be >= 0.5 hours.")
+
+
+COST_BASES = ("per_batch", "per_shift", "per_operating_hour", "per_working_day", "per_calendar_day")
+TIMING_KEYS = ("working_days", "idle_days", "calendar_days_per_cycle", "total_shifts",
+               "operating_hours", "L_person_hours", "B_HH")
+
+
+@dataclass
 class Jackpot:
     """Truncated Pareto jackpot magnitude on [threshold, cap] (grams per cycle).
 
-    threshold: smallest yield counted as a jackpot (default scenario: lowest reported jackpot)
+    threshold: smallest yield counted as a jackpot (elicited per completed batch)
     cap:       physical upper bound (e.g. equipment/ore capacity)
     shape:     Pareto tail index; ASSUMED -- treat as a sensitivity parameter
     """
@@ -221,6 +270,7 @@ class CostItem:
     miner_share: float = 1.0
     fixed: Optional[float] = None
     pert: Optional[PERT] = None
+    basis: str = "per_batch"                  # amount/rate for the whole operation
 
 
 @dataclass
@@ -279,6 +329,7 @@ class EquipmentItem:
 class Inputs:
     # --- accounting unit / labour ---
     n_c: int                                  # active crew size
+    batch_timing: Optional[BatchTiming] = None
     D_c: int = 1                              # shifts in the cycle
     calendar_days_per_cycle: Optional[float] = None  # legacy fallback: one day per shift
     hours_per_worker_shift: float = 8.0       # h
@@ -324,12 +375,16 @@ class Inputs:
 
     # derived helpers -----------------------------------------------------------------
     def person_hours(self) -> float:
+        if self.batch_timing is not None:
+            raise InputError("Batch person-hours are sampled per draw; use result arrays.")
         if self.hours_matrix is not None:
             return float(np.sum(np.asarray(self.hours_matrix, dtype=float)))
         return float(self.n_c * self.D_c * self.hours_per_worker_shift)
 
     def calendar_days(self) -> float:
         """Calendar days covered by the cycle, falling back to one day per shift if unset."""
+        if self.batch_timing is not None:
+            raise InputError("Batch calendar days are sampled per draw; use result arrays.")
         return float(self.D_c if self.calendar_days_per_cycle is None else self.calendar_days_per_cycle)
 
     def household_requirement(self) -> float:
@@ -347,8 +402,12 @@ class Inputs:
     def all_cost_items(self) -> List[CostItem]:
         items = list(self.costs)
         for eq in self.equipment:
-            items.append(CostItem(name=f"equipment:{eq.name}", miner_share=eq.miner_share,
-                                  fixed=eq.cost_per_cycle(self.D_c)))
+            if self.batch_timing is not None and eq.mode == "rented":
+                items.append(CostItem(name=f"equipment:{eq.name}", miner_share=eq.miner_share,
+                                      fixed=eq.rental_rate_per_shift, basis="per_shift"))
+            else:
+                items.append(CostItem(name=f"equipment:{eq.name}", miner_share=eq.miner_share,
+                                      fixed=eq.cost_per_cycle(self.D_c)))
         return items
 
     def stochastic_cost_items(self) -> List[CostItem]:
@@ -374,23 +433,39 @@ def validate(inp: Inputs) -> List[str]:
     for name in ("s_m", "pi_J", "W_opp", "hh_need_per_household_day", "nonmining_income_per_household_day"):
         require_finite(name, getattr(inp, name), errs)
     require_integer("n_c", inp.n_c, 1, errs)
-    require_integer("D_c", inp.D_c, 1, errs)
     if inp.n_households is not None:
         require_integer("n_households", inp.n_households, 0, errs)
-    if inp.hours_matrix is None:
+    if inp.batch_timing is not None:
+        if not isinstance(inp.batch_timing, BatchTiming):
+            errs.append("batch_timing: must be a BatchTiming configuration.")
+        else:
+            inp.batch_timing.check(errs)
+        if inp.hours_matrix is not None or inp.calendar_days_per_cycle is not None:
+            errs.append("batch_timing cannot be combined with fixed calendar days or an hours matrix.")
+        if inp.D_c != 1 or inp.hours_per_worker_shift != 8.0:
+            errs.append("batch_timing cannot override fixed shifts/hours; leave their defaults unchanged.")
+        require_integer("D_c", inp.D_c, 1, errs)
         require_finite("hours_per_worker_shift", inp.hours_per_worker_shift, errs)
+        if inp.n_households is not None and inp.n_households != inp.n_c:
+            errs.append("batch_timing requires one household per registered worker.")
+        if inp.nonmining_income_per_household_day != 0:
+            errs.append("batch_timing does not support nonmining-income offsets.")
     else:
-        try:
-            hm = _finite_array("hours_matrix", inp.hours_matrix)
-            if hm.shape != (inp.D_c, inp.n_c) or np.any(hm < 0):
-                errs.append("hours_matrix: must have shape (D_c, n_c) and nonnegative hours.")
-        except InputError as exc:
-            errs.append(str(exc))
-    if inp.calendar_days_per_cycle is None:
-        warns.append("calendar_days_per_cycle omitted: assuming one calendar day per shift.")
-    elif require_finite("calendar_days_per_cycle", inp.calendar_days_per_cycle, errs):
-        if inp.calendar_days_per_cycle <= 0:
-            errs.append("calendar_days_per_cycle: must be > 0.")
+        require_integer("D_c", inp.D_c, 1, errs)
+        if inp.hours_matrix is None:
+            require_finite("hours_per_worker_shift", inp.hours_per_worker_shift, errs)
+        else:
+            try:
+                hm = _finite_array("hours_matrix", inp.hours_matrix)
+                if hm.shape != (inp.D_c, inp.n_c) or np.any(hm < 0):
+                    errs.append("hours_matrix: must have shape (D_c, n_c) and nonnegative hours.")
+            except InputError as exc:
+                errs.append(str(exc))
+        if inp.calendar_days_per_cycle is None:
+            warns.append("calendar_days_per_cycle omitted: assuming one calendar day per shift.")
+        elif require_finite("calendar_days_per_cycle", inp.calendar_days_per_cycle, errs):
+            if inp.calendar_days_per_cycle <= 0:
+                errs.append("calendar_days_per_cycle: must be > 0.")
     if not isinstance(inp.price, PERT):
         require_finite("price", inp.price, errs)
     if inp.price_basis == "reference" and not isinstance(inp.purity, PERT):
@@ -421,22 +496,23 @@ def validate(inp: Inputs) -> List[str]:
             errs.append("reserve_custom_per_cycle: must be >= 0.")
     _raise_errors(errs)
 
-    # crew, labour
-    if not isinstance(inp.n_c, (int, np.integer)) or inp.n_c < 1:
-        errs.append("n_c: crew size must be an integer >= 1 (active contributors only).")
-    if not isinstance(inp.D_c, (int, np.integer)) or inp.D_c < 1:
-        errs.append("D_c: shifts per cycle must be an integer >= 1.")
-    if inp.hours_matrix is not None:
-        hm = np.asarray(inp.hours_matrix, dtype=float)
-        if hm.ndim != 2 or np.any(hm < 0):
-            errs.append("hours_matrix: must be a 2-D matrix of hours >= 0.")
-    elif inp.hours_per_worker_shift <= 0:
-        errs.append("hours_per_worker_shift must be > 0.")
-    try:
-        if not finite_number(inp.person_hours()) or inp.person_hours() <= 0:
-            errs.append("Person-hours L must be > 0 (cannot be replaced by shift duration alone).")
-    except Exception:
-        errs.append("Person-hours L could not be computed from the labour inputs.")
+    if inp.batch_timing is None:
+        # crew, labour
+        if not isinstance(inp.n_c, (int, np.integer)) or inp.n_c < 1:
+            errs.append("n_c: crew size must be an integer >= 1 (active contributors only).")
+        if not isinstance(inp.D_c, (int, np.integer)) or inp.D_c < 1:
+            errs.append("D_c: shifts per cycle must be an integer >= 1.")
+        if inp.hours_matrix is not None:
+            hm = np.asarray(inp.hours_matrix, dtype=float)
+            if hm.ndim != 2 or np.any(hm < 0):
+                errs.append("hours_matrix: must be a 2-D matrix of hours >= 0.")
+        elif inp.hours_per_worker_shift <= 0:
+            errs.append("hours_per_worker_shift must be > 0.")
+        try:
+            if not finite_number(inp.person_hours()) or inp.person_hours() <= 0:
+                errs.append("Person-hours L must be > 0 (cannot be replaced by shift duration alone).")
+        except Exception:
+            errs.append("Person-hours L could not be computed from the labour inputs.")
 
     # shares
     if not (0 < inp.s_m <= 1):
@@ -458,8 +534,7 @@ def validate(inp: Inputs) -> List[str]:
                 errs.append("Jackpot: need 0 < threshold < cap.")
             if j.shape <= 0:
                 errs.append("Jackpot: Pareto shape must be > 0.")
-            warns.append("Jackpot shape/threshold rest on very few reported jackpots; "
-                         "treat as a sensitivity parameter.")
+            warns.append("Jackpot shape and threshold are scenario parameters; sensitivity-test them.")
     z = inp.zero
     if z.p0 is not None:
         if not (0 <= z.p0 <= 1):
@@ -502,6 +577,12 @@ def validate(inp: Inputs) -> List[str]:
 
     names = set()
     for c in cost_items:
+        if c.basis not in COST_BASES:
+            errs.append(f"Cost '{c.name}': unknown expense basis.")
+        if inp.batch_timing is None and c.basis == "per_working_day":
+            errs.append(f"Cost '{c.name}': working-day expenses require batch_timing.")
+        if inp.hours_matrix is not None and c.basis == "per_operating_hour":
+            errs.append(f"Cost '{c.name}': operating exposure is ambiguous with an hours matrix.")
         if c.name in names:
             errs.append(f"Cost '{c.name}' appears twice (each cost must appear exactly once).")
         names.add(c.name)
@@ -544,15 +625,21 @@ def validate(inp: Inputs) -> List[str]:
 
     _raise_errors(errs)
     try:
-        derived = (inp.household_requirement(), *inp.depreciation(),
+        derived = (inp.household_requirement() if inp.batch_timing is None else 0., *inp.depreciation(),
                    *(eq.cost_per_cycle(inp.D_c) for eq in inp.equipment))
+        if inp.batch_timing is not None:
+            t = inp.batch_timing
+            # Check maximum derived exposures before NumPy can overflow or create object arrays.
+            calendar_max = t.work_days.b + t.idle_days.b
+            derived += (calendar_max, inp.n_c * (24. * t.work_days.b),
+                        inp.n_c * calendar_max * inp.hh_need_per_household_day)
         if not all(finite_number(x) for x in derived):
             raise ValueError()
         if inp.zero.p0 is None and not all(finite_number(x) for x in
                 (inp.zero.prior_a + inp.zero.z, inp.zero.prior_b + inp.zero.n - inp.zero.z)):
             raise ValueError()
     except (OverflowError, ValueError, ZeroDivisionError) as exc:
-        raise InputError("Derived household, equipment or zero-yield parameters exceed finite numeric limits.") from exc
+        raise InputError("Derived timing, household, equipment or zero-yield parameters exceed finite numeric limits.") from exc
     return warns
 
 
@@ -566,9 +653,40 @@ def _copula_chol(inp: Inputs) -> Optional[np.ndarray]:
     return np.linalg.cholesky(spearman_to_pearson(np.asarray(inp.rho_spearman, dtype=float)))
 
 
+def sample_timing(inp: Inputs, rng: np.random.Generator, size: int) -> Dict[str, np.ndarray]:
+    if inp.batch_timing is None:
+        return {"calendar_days_per_cycle": np.full(size, inp.calendar_days()),
+                "total_shifts": np.full(size, inp.D_c, dtype=int),
+                "operating_hours": np.full(size, inp.D_c * inp.hours_per_worker_shift),
+                "L_person_hours": np.full(size, inp.person_hours()),
+                "B_HH": np.full(size, inp.household_requirement())}
+    t = inp.batch_timing
+    work = np.floor(t.work_days.sample(rng, size) + .5).astype(int)
+    idle = t.idle_days.sample(rng, size)
+    shifts = np.zeros(size, dtype=int)
+    hours = np.zeros(size)
+    for day in range(int(work.max())):
+        active = np.flatnonzero(work > day)
+        daily = rng.choice([1, 2, 3], size=len(active), p=np.asarray(t.shift_counts) / 10.)
+        shifts[active] += daily
+        for d in (1, 2, 3):
+            ix = active[daily == d]
+            hours[ix] += d * t.hours_by_shifts[d].sample(rng, len(ix))
+    calendar = work + idle
+    return {"working_days": work, "idle_days": idle, "calendar_days_per_cycle": calendar,
+            "total_shifts": shifts, "operating_hours": hours, "L_person_hours": inp.n_c * hours,
+            "B_HH": inp.n_c * calendar * inp.hh_need_per_household_day}
+
+
+def expense_exposure(basis: str, timing: Dict[str, np.ndarray]):
+    keys = {"per_shift": "total_shifts", "per_operating_hour": "operating_hours",
+            "per_working_day": "working_days", "per_calendar_day": "calendar_days_per_cycle"}
+    return 1.0 if basis == "per_batch" else timing[keys[basis]]
+
+
 def sample_costs(inp: Inputs, rng: np.random.Generator, size: int,
                  chol: Optional[np.ndarray]) -> Dict[str, np.ndarray]:
-    """Draw every cost category for `size` cycles. Stochastic costs share a Gaussian copula."""
+    """Draw expense rates (or batch amounts); stochastic rates share a Gaussian copula."""
     items = inp.all_cost_items()
     sto = [c for c in items if c.pert is not None]
     out: Dict[str, np.ndarray] = {}
@@ -588,7 +706,7 @@ def sample_costs(inp: Inputs, rng: np.random.Generator, size: int,
 
 
 def sample_batch(inp: Inputs, rng: np.random.Generator, size: int,
-                 chol: Optional[np.ndarray]) -> Dict[str, np.ndarray]:
+                 chol: Optional[np.ndarray], timing_rng: Optional[np.random.Generator] = None) -> Dict[str, np.ndarray]:
     p0 = inp.zero.draw_p0(rng, size)
     positive = rng.random(size) >= p0                    # hurdle: True = productive cycle
     is_jack = rng.random(size) < inp.pi_J                # given productive
@@ -604,27 +722,29 @@ def sample_batch(inp: Inputs, rng: np.random.Generator, size: int,
         q = np.full(size, float(inp.purity))
     P = inp.price.sample(rng, size) if isinstance(inp.price, PERT) else np.full(size, float(inp.price))
 
-    costs = sample_costs(inp, rng, size, chol)
+    rates = sample_costs(inp, rng, size, chol)
+    timing = sample_timing(inp, rng if timing_rng is None else timing_rng, size)
+    costs = {c.name: rates[c.name] * expense_exposure(c.basis, timing) for c in inp.all_cost_items()}
     miner_share = {c.name: c.miner_share for c in inp.all_cost_items()}
     C_tot = np.zeros(size)
     C_m = np.zeros(size)
     for name, arr in costs.items():
         C_tot += arr
         C_m += miner_share[name] * arr
-    return {"Y": Y, "q": q, "P": P, "C_tot": C_tot, "C_m": C_m, "costs": costs, "p0": p0}
+    return {"Y": Y, "q": q, "P": P, "C_tot": C_tot, "C_m": C_m, "costs": costs, "rates": rates, "timing": timing, "p0": p0}
 
 
 # ----------------------------------------------------------------------------------------
 # Accounting kernel (stakeholder cash flow + three thresholds)
 # ----------------------------------------------------------------------------------------
-def accounting_kernel(Y, q, P, C_m, C_tot, *, s_m: float, L: float, W_opp: float,
-                      B_HH: float, tribute_base: str = "gross",
+def accounting_kernel(Y, q, P, C_m, C_tot, *, s_m: float, L: Union[float, np.ndarray], W_opp: float,
+                      B_HH: Union[float, np.ndarray], tribute_base: str = "gross",
                       depreciation_total: float = 0.0, depreciation_miner: float = 0.0,
                       reserve_mode: str = "none", reserve_location: Optional[str] = None,
                       reserve_priority: Optional[str] = None,
                       reserve_custom_per_cycle: float = 0.0) -> Dict[str, np.ndarray]:
     """Vectorised, unit-checked accounting. Inputs are arrays per cycle (group level)."""
-    F = Y * q                                  # fine-gold equivalent (g)
+    F = Y * q                                  # valuation mass (fine gold only in reference mode)
     R = F * P                                  # gross revenue (PHP)
     Rm = s_m * R                               # miner-group revenue
     C_eff = C_m if tribute_base == "gross" else s_m * C_tot   # costs the miner group effectively bears
@@ -689,8 +809,10 @@ def risk_band(p_meet_benchmark: float, low_cut: float = 0.67, mod_cut: float = 0
     return "high"
 
 
-def _prob_counts(a: Dict[str, np.ndarray], W_opp: float, B_HH: float) -> Dict[str, int]:
+def _prob_counts(a: Dict[str, np.ndarray], W_opp: float, B_HH=None) -> Dict[str, int]:
     """Count, per risk probability key, how many simulated cycles trigger the event."""
+    if B_HH is None:
+        B_HH = a["B_HH"]
     events = {
         "P_negative_operating_return": a["Pi"] < 0,
         "P_labor_return_below_wage": a["E"] < W_opp,
@@ -767,8 +889,7 @@ def run(inp: Inputs, *, seed: int = 42, batch_size: int = 5_000, n_min: int = 10
     warns = validate(inp)
     rng = np.random.default_rng(seed)
     chol = _copula_chol(inp)
-    L = inp.person_hours()
-    B_HH = inp.household_requirement()
+    timing_rng = np.random.default_rng(np.random.SeedSequence(seed).spawn(1)[0])
     dep_total, dep_miner = inp.depreciation()
 
     chunks: List[Dict[str, np.ndarray]] = []
@@ -778,20 +899,21 @@ def run(inp: Inputs, *, seed: int = 42, batch_size: int = 5_000, n_min: int = 10
     target = n_fixed if n_fixed is not None else n_max
     while N < target:
         b = min(batch_size, target - N)
-        d = sample_batch(inp, rng, b, chol)
-        k = accounting_kernel(d["Y"], d["q"], d["P"], d["C_m"], d["C_tot"], s_m=inp.s_m, L=L,
-                              W_opp=inp.W_opp, B_HH=B_HH, tribute_base=inp.tribute_base,
+        d = sample_batch(inp, rng, b, chol, timing_rng)
+        k = accounting_kernel(d["Y"], d["q"], d["P"], d["C_m"], d["C_tot"], s_m=inp.s_m, L=d["timing"]["L_person_hours"],
+                              W_opp=inp.W_opp, B_HH=d["timing"]["B_HH"], tribute_base=inp.tribute_base,
                               depreciation_total=dep_total, depreciation_miner=dep_miner,
                               reserve_mode=inp.reserve_mode, reserve_location=inp.reserve_location,
                               reserve_priority=inp.reserve_priority,
                               reserve_custom_per_cycle=inp.reserve_custom_per_cycle)
-        chunk = {**{n: d[n] for n in ("Y", "q", "P", "C_tot", "C_m", "p0")}, **k,
-                 **{f"cost::{n}": a for n, a in d["costs"].items()}}
+        chunk = {**{n: d[n] for n in ("Y", "q", "P", "C_tot", "C_m", "p0")}, **k, **d["timing"],
+                 **{f"cost::{n}": a for n, a in d["costs"].items()},
+                 **{f"rate::{n}": a for n, a in d["rates"].items()}}
         for name, values in chunk.items():
             if not np.all(np.isfinite(values)):
                 raise InputError(f"Simulation produced non-finite {name}; check input magnitudes.")
         chunks.append(chunk)
-        c = _prob_counts(chunk, inp.W_opp, B_HH)
+        c = _prob_counts(chunk, inp.W_opp)
         for key in PROB_KEYS:
             counts[key] += c[key]
         N += b
@@ -812,8 +934,7 @@ def run(inp: Inputs, *, seed: int = 42, batch_size: int = 5_000, n_min: int = 10
     probs = {key: counts[key] / N for key in PROB_KEYS}
     p5, p50, p95 = np.percentile(E, [5, 50, 95])
     summary: Dict[str, float] = {
-        "N": N, "converged": converged, "L_person_hours": L, "B_HH": B_HH,
-        "calendar_days_per_cycle": inp.calendar_days(),
+        "N": N, "converged": converged,
         **probs,
         **{f"MCSE_{key}": mcse_prob(counts[key], N) for key in PROB_KEYS},
         "E_mean": float(E.mean()), "E_median": float(p50), "E_P5": float(p5), "E_P95": float(p95),
@@ -827,6 +948,13 @@ def run(inp: Inputs, *, seed: int = 42, batch_size: int = 5_000, n_min: int = 10
         "risk_band_vs_wage": risk_band(1.0 - probs["P_labor_return_below_wage"]),
     }
 
+    if inp.batch_timing is None:
+        summary.update(L_person_hours=inp.person_hours(), B_HH=inp.household_requirement(),
+                       calendar_days_per_cycle=inp.calendar_days())
+    for name in TIMING_KEYS:
+        if name in arr:
+            summary[f"{name}_mean"] = float(arr[name].mean())
+            summary[f"{name}_median"] = float(np.median(arr[name]))
     for name in ("cash_before_reserve", "cash_after_reserve", "reserve_planned", "reserve_funded",
                  "reserve_shortfall", "reserve_miner_contribution", "depreciation_miner"):
         summary[f"{name}_mean"] = float(arr[name].mean())
@@ -837,7 +965,7 @@ def run(inp: Inputs, *, seed: int = 42, batch_size: int = 5_000, n_min: int = 10
     # ---- staged-N stability table ----
     rows = []
     for n_k in sorted(set([s for s in STAGES if s <= N] + [N])):
-        pk = _prob_counts({name: values[:n_k] for name, values in arr.items()}, inp.W_opp, B_HH)
+        pk = _prob_counts({name: values[:n_k] for name, values in arr.items()}, inp.W_opp)
         row = {"N": n_k, "E_mean": float(E[:n_k].mean()), "E_median": float(np.median(E[:n_k]))}
         for key in PROB_KEYS:
             row[key] = pk[key] / n_k
@@ -849,7 +977,12 @@ def run(inp: Inputs, *, seed: int = 42, batch_size: int = 5_000, n_min: int = 10
     m = min(sens_rows, N)
     sens: Dict[str, float] = {}
     candidates = {"yield_Y": arr["Y"][:m], "purity_q": arr["q"][:m], "price_P": arr["P"][:m]}
+    for name in TIMING_KEYS:
+        if name in arr:
+            candidates[name] = arr[name][:m]
     for name, a in arr.items():
+        if name.startswith("rate::"):
+            candidates[name.replace("rate::", "rate_")] = a[:m]
         if name.startswith("cost::"):
             candidates[name.replace("cost::", "cost_")] = a[:m]
     for name, a in candidates.items():
@@ -897,8 +1030,22 @@ def build_manifest(inp: Inputs, **cfg) -> Dict[str, object]:
         "inputs_sha256": hashlib.sha256(inputs_json.encode()).hexdigest(),
         "inputs": json.loads(inputs_json),
         "provenance": dict(inp.provenance),
-        "resolved_calendar_days_per_cycle": inp.calendar_days(),
-        "calendar_days_assumed_from_shifts": inp.calendar_days_per_cycle is None,
+        **({"resolved_calendar_days_per_cycle": inp.calendar_days(),
+            "calendar_days_assumed_from_shifts": inp.calendar_days_per_cycle is None}
+           if inp.batch_timing is None else {}),
+        "timing_mode": "batch" if inp.batch_timing is not None else "fixed",
+        "timing_rules": {"work_days": "floor(PERT + 0.5), whole days 1..3650",
+                         "calendar_days": "working_days + independent nonnegative PERT idle_days",
+                         "schedule": "independent daily categorical count; one conditional duration per day; full crew",
+                         "timing_rng": "SeedSequence(seed).spawn(1)[0]",
+                         "households": "one per worker; no income offset"} if inp.batch_timing else {},
+        "expense_bases": {c.name: c.basis for c in inp.all_cost_items()},
+        "correlation_order": [c.name for c in inp.stochastic_cost_items()],
+        "correlation_scope": "expense rates before exposure scaling",
+        "assumptions": ["batch yield, valuation, and timing independent",
+                        "worksite food is additional consumption excluded from household needs",
+                        "operating hours equal summed scheduled shift durations"],
+        "valuation_mass_label": "fine gold mass" if inp.price_basis == "reference" else "recovered gold mass",
         "accounting_basis": {"Pi": "economic_profit", "E": "economic_profit_per_person_hour",
                              "Y_HH": "economic_profit_household_threshold",
                              "reserve_amounts": "common_fund" if inp.reserve_location == "before_sharing" else "miner_fund",

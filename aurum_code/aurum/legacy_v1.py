@@ -8,7 +8,7 @@ that Chapter 3 can describe V1.0 exactly as it was implemented.
 
 Known V1.0 limitations (documented for the manuscript, intentionally NOT fixed here):
   * lognormal calibration assumes min = 5th percentile and max = 99th percentile
-    (constants 1.645 and 2.326) -- never elicited from respondents
+    (constants 1.645 and 2.326) -- these percentile assignments are assumptions
   * no zero-yield state; the "jackpot" component is a lognormal anchored at Gf_min
   * jackpot frequency is a heuristic clamp(2*Gf_sub_max/Gf_jack_max, 0.2, 5.0) percent
   * H (shift duration) is the labour denominator, not person-hours

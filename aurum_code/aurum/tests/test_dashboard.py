@@ -21,7 +21,7 @@ import dashboard_logic as DL             # noqa: E402
 import engine_v2 as E2                   # noqa: E402
 import legacy_v1                         # noqa: E402
 from fake_streamlit import run_app       # noqa: E402
-from scenarios import pilot_provisional  # noqa: E402
+from scenarios import batch_synthetic, fixed_synthetic  # noqa: E402
 
 BASE = DL.PRESETS[0]
 FORBIDDEN = ["debt trap", "immediate exit", "greenlight", "gambling", "real economic sustainability",
@@ -34,9 +34,17 @@ def vals(**kw):
 
 class TestMapping(unittest.TestCase):
     def test_ui_values_round_trip_to_identical_simulation(self):
-        a = E2.run(dataclasses.replace(pilot_provisional(), W_opp_source="", W_opp_date=""), n_fixed=20_000, seed=42)
+        a = E2.run(dataclasses.replace(batch_synthetic(), W_opp_source="", W_opp_date=""), n_fixed=20_000, seed=42)
         b = E2.run(DL.build_inputs(DL.preset_values(BASE), BASE), n_fixed=20_000, seed=42)
         np.testing.assert_array_equal(a.arrays["E"], b.arrays["E"])
+
+    def test_fixed_transport_alias_preserves_rate_correlation(self):
+        values = DL.values_from_inputs(fixed_synthetic())
+        self.assertEqual(values["rho_fuel_trans"], .5)
+        restored = DL.build_inputs(values)
+        self.assertEqual(restored.rho_spearman[0][3], .5)
+        self.assertEqual(restored.rho_spearman[3][0], .5)
+        E2.validate(restored)
 
     def test_all_presets_build_and_run(self):
         for p in DL.PRESETS:
@@ -69,11 +77,11 @@ class TestMapping(unittest.TestCase):
 
 class TestProvenance(unittest.TestCase):
     def test_default_values_keep_preset_tag_and_edits_become_user(self):
-        self.assertEqual(DL.tag_for("n_c", 5, BASE), "assumed")
+        self.assertEqual(DL.tag_for("n_c", 4, BASE), "synthetic")
         self.assertEqual(DL.tag_for("n_c", 6, BASE), "user")
-        self.assertEqual(DL.tag_for("s_m", 0.658, BASE), "pilot")
+        self.assertEqual(DL.tag_for("s_m", 0.50, BASE), "synthetic")
         self.assertEqual(DL.tag_for("s_m", 0.7, BASE), "user")
-        self.assertEqual(DL.tag_for("tribute_base", "gross", BASE), "assumed")
+        self.assertEqual(DL.tag_for("tribute_base", "gross", BASE), "synthetic")
 
     def test_synthetic_presets_tag_their_synthetic_inputs(self):
         self.assertEqual(DL.tag_for("fuel_mode", DL.preset_values(DL.PRESETS[1])["fuel_mode"], DL.PRESETS[1]), "synthetic")
@@ -82,7 +90,7 @@ class TestProvenance(unittest.TestCase):
     def test_effective_tags_flow_into_manifest(self):
         inp, res = DL.run_v2(vals(n_c=6), BASE)
         self.assertEqual(inp.provenance["n_c"], "user")
-        self.assertEqual(inp.provenance["s_m"], "pilot")
+        self.assertEqual(inp.provenance["s_m"], "synthetic")
         m = json.loads(DL.export_manifest(res, {"preset": BASE}))
         self.assertEqual(m["provenance"]["n_c"], "user")
         self.assertEqual(m["preset"], BASE)
@@ -90,7 +98,8 @@ class TestProvenance(unittest.TestCase):
 
     def test_assumed_list_matches_tags(self):
         tags = DL.effective_tags(DL.preset_values(BASE), BASE)
-        self.assertIn("n_c", DL.assumed_inputs(tags))
+        self.assertEqual(DL.assumed_inputs(tags), [])
+        self.assertEqual(DL.assumed_inputs({"example": "assumed"}), ["example"])
         self.assertNotIn("s_m", DL.assumed_inputs(tags))
 
 
@@ -115,7 +124,7 @@ class TestOutputs(unittest.TestCase):
         self.assertIn("not validated", DL.risk_band_text(self.res))
 
     def test_figures_have_labelled_axes(self):
-        figs = [DL.fig_return_density(self.res.arrays["E"], 65.63),
+        figs = [DL.fig_return_density(self.res.arrays["E"], 100.0),
                 DL.fig_yield_exceedance(self.res.arrays["Y"], {"BE": 0.5, "W": 0.8, "HH": 1.2}),
                 DL.fig_stability(self.res.stage_table), DL.fig_rank_sensitivity(self.res.rank_sensitivity)]
         for f in figs:
@@ -124,7 +133,7 @@ class TestOutputs(unittest.TestCase):
             self.assertNotIn("poverty", ax.get_title().lower())
 
     def test_density_figure_survives_constant_returns(self):
-        DL.fig_return_density(np.full(500, 70.0), 65.63)
+        DL.fig_return_density(np.full(500, 70.0), 100.0)
 
     def test_csv_export_shape_and_columns(self):
         df = __import__("pandas").read_csv(io.BytesIO(DL.export_csv(self.res, 1000)))
@@ -146,12 +155,12 @@ class TestLegacy(unittest.TestCase):
     def test_run_legacy_matches_frozen_function(self):
         v = {**DL.LEGACY_DEFAULTS, "N": 20_000}
         a = DL.run_legacy(v)
-        b = legacy_v1.run_monte_carlo(8, 0.85, 44.80, 65.63, 80.0, 1.10, 160.0, 0.02, 0.33, 1.45, 19.47, 0.95,
-                                      7282.35, 8900.65, 20_000)
+        b = legacy_v1.run_monte_carlo(8, .8, 90., 100., 1200., 1.1, 800., .02, 5., 20., 60., .9,
+                                      5000., 6000., 20_000)
         self.assertEqual(a["success_rate"], b["success_rate"])
 
     def test_legacy_validation_matches_v1_rules(self):
-        e = DL.legacy_errors({**DL.LEGACY_DEFAULTS, "Gmin": 2.0})                   # min above typical max
+        e = DL.legacy_errors({**DL.LEGACY_DEFAULTS, "Gmin": 25.0})                   # min above typical max
         self.assertEqual(len(e), 1)
         self.assertIn("minimum yield", e[0])
         self.assertEqual(len(DL.legacy_errors({**DL.LEGACY_DEFAULTS, "Gjack": 1.0, "Pmin": 9000.0})), 2)
@@ -205,7 +214,14 @@ class TestAppSmoke(unittest.TestCase):
         """Running the scenario grid populates the overview, convergence and grid dataframes."""
         f1, _ = run_app(overrides={"n_max": 50_000}, submit=True)
         f2, _ = run_app(submit=False, press={"Run scenario grid"}, session_state=f1.session_state)
-        self.assertEqual(len(f2.calls("dataframe")), 3 + 2 + 1)      # overview 3, convergence 1, grid 2
+        self.assertEqual(len(f2.calls("dataframe")), 4 + 2 + 1)      # overview 4, convergence 1, grid 2
+
+    def test_fixed_timing_explains_unsupported_daily_rates_before_submit(self):
+        fake, stopped = run_app(overrides={"timing_mode": "fixed"}, submit=False)
+        self.assertFalse(stopped)
+        warnings = " ".join(str(a[0]) for a, _ in fake.calls("warning"))
+        self.assertIn("Explosives: fixed timing has no working-day count", warnings)
+        self.assertIn("enter its corresponding rates", warnings)
 
     def test_legacy_mode_renders_with_warning_and_flaw_list(self):
         fake, stopped = run_app(overrides={"version": "V1.0 (legacy, frozen - comparison only)", "N": 10_000}, submit=True)
@@ -217,7 +233,7 @@ class TestAppSmoke(unittest.TestCase):
         self.assertNotIn("debt trap", blob)
 
     def test_legacy_invalid_ordering_is_rejected(self):
-        fake, stopped = run_app(overrides={"version": "V1.0 (legacy, frozen - comparison only)", "Gmin": 2.0}, submit=True)
+        fake, stopped = run_app(overrides={"version": "V1.0 (legacy, frozen - comparison only)", "Gmin": 25.0}, submit=True)
         self.assertTrue(stopped)
         self.assertTrue(fake.calls("error"))
 

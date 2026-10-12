@@ -37,7 +37,7 @@ class TestSwitches(unittest.TestCase):
     def test_explicit_labor_lowers_return_every_draw(self):
         a = AB.simulate(AB.V1, N)["E"]
         b = AB.simulate(dataclasses.replace(AB.V1, labor="explicit"), N)["E"]
-        self.assertTrue(np.all(b < a))             # 0.658/5 = 0.1316 < rounded 0.15 on every draw
+        self.assertTrue(np.all(b < a))             # group share / crew is below the synthetic V1 share on every draw
 
     def test_purity_once_raises_return_every_draw(self):
         a = AB.simulate(AB.V1, N)["E"]
@@ -144,6 +144,7 @@ class TestOutputs(unittest.TestCase):
                 txt = fh.read()
             self.assertIn("scenario result", txt.lower())
             self.assertIn("Detectable?", txt)
+            self.assertIn(f"[{AB.ASSUME['jack_threshold']}, {AB.ASSUME['jack_cap']}] g", txt)
             self.assertNotIn("poverty", txt.lower())
 
 

@@ -22,11 +22,11 @@ import legacy_v1                            # noqa: E402
 from engine_v2 import (CostItem, EquipmentItem, InputError, Jackpot, PERT, ZeroYield,  # noqa: E402
                        accounting_kernel, mcse_prob, risk_band, run, sample_costs,
                        scenario_table, spearman_to_pearson, validate)
-from scenarios import pilot_provisional, synthetic_profiles  # noqa: E402
+from scenarios import fixed_synthetic, synthetic_profiles  # noqa: E402
 
 
 def base(**kw):
-    inp = pilot_provisional()
+    inp = fixed_synthetic()
     inp = dataclasses.replace(inp, W_opp_source="test", W_opp_date="test")
     return dataclasses.replace(inp, **kw) if kw else inp
 
@@ -60,12 +60,12 @@ class TestDistributions(unittest.TestCase):
         self.assertTrue(np.all(x == 5))
 
     def test_jackpot_truncated_no_atom_at_cap(self):
-        j = Jackpot(14.4, 24.0, 1.5)
+        j = Jackpot(30.0, 60.0, 1.5)
         x = j.sample(np.random.default_rng(2), 300_000)
-        self.assertTrue(x.min() >= 14.4 and x.max() <= 24.0)
-        self.assertLess(np.mean(x >= 24.0 - 1e-9), 1e-3)       # no mass piled on the cap
-        tail = 1 - (14.4 / 24.0) ** 1.5
-        median = 14.4 / (1 - 0.5 * tail) ** (1 / 1.5)
+        self.assertTrue(x.min() >= 30.0 and x.max() <= 60.0)
+        self.assertLess(np.mean(x >= 60.0 - 1e-9), 1e-3)       # no mass piled on the cap
+        tail = 1 - (30.0 / 60.0) ** 1.5
+        median = 30.0 / (1 - 0.5 * tail) ** (1 / 1.5)
         self.assertAlmostEqual(np.median(x), median, delta=0.05)
 
     def test_zero_share_matches_p0_within_mcse(self):
@@ -118,9 +118,9 @@ class TestValidation(unittest.TestCase):
         self.assertIn("wage-paid", str(cm.exception))
 
     def test_reference_basis_rejects_zero_or_over_unity_purity(self):
-        self.bad(price_basis="reference", price=8400.0, purity=0.0)
-        self.bad(price_basis="reference", price=8400.0, purity=1.3)
-        self.bad(price_basis="reference", price=8400.0, purity=PERT(0.8, 0.9, 1.2))
+        self.bad(price_basis="reference", price=6000.0, purity=0.0)
+        self.bad(price_basis="reference", price=6000.0, purity=1.3)
+        self.bad(price_basis="reference", price=6000.0, purity=PERT(0.8, 0.9, 1.2))
 
     def test_cost_rules(self):
         b = base()
@@ -142,7 +142,7 @@ class TestValidation(unittest.TestCase):
             validate(dataclasses.replace(three, rho_spearman=[[1, .99, -.99], [.99, 1, .99], [-.99, .99, 1]]))
 
     def test_unsourced_wage_gives_warning_not_error(self):
-        w = validate(pilot_provisional())
+        w = validate(fixed_synthetic())
         self.assertTrue(any("W_opp" in x for x in w))
 
 
@@ -208,7 +208,7 @@ class TestAccounting(unittest.TestCase):
         a = run(base(purity=0.5), n_fixed=10_000).arrays["E"]       # farmgate basis: purity must be ignored
         b = run(base(purity=1.0), n_fixed=10_000).arrays["E"]
         np.testing.assert_array_equal(a, b)
-        ref = dataclasses.replace(base(), price_basis="reference", price=8400.0)
+        ref = dataclasses.replace(base(), price_basis="reference", price=6000.0)
         lo = run(dataclasses.replace(ref, purity=0.8), n_fixed=10_000).arrays["R"]
         hi = run(dataclasses.replace(ref, purity=1.0), n_fixed=10_000).arrays["R"]
         np.testing.assert_allclose(lo, hi * 0.8)                     # reference basis: purity applied exactly once
@@ -351,23 +351,21 @@ class TestOutputsAndLabels(unittest.TestCase):
 
     def test_synthetic_profiles_run_and_differ(self):
         out = {k: run(v, n_fixed=20_000).summary for k, v in synthetic_profiles().items()}
-        self.assertGreater(out["High-Cost"]["P_negative_operating_return"],
-                           out["Baseline"]["P_negative_operating_return"])
+        self.assertLess(out["High-Cost"]["E_mean"], out["Baseline"]["E_mean"])
         self.assertGreater(out["Low-Purity"]["P_labor_return_below_wage"], 0)
 
 
 class TestLegacyRegression(unittest.TestCase):
     """V2.0 accounting kernel must reproduce V1.0 equations on IDENTICAL draws.
 
-    Benchmark = the screenshot run (H=8, T=0.85, Cfamily=44.80, Cfixed=80, delta=1.10, Cfuel=160,
-    alpha=0.02, eta=0.95, price 7282.35-8900.65, yields 0.33/1.45/19.47) executed with the frozen
+    Independent synthetic inputs exercise the unchanged
     V1.0 code. Mapping: n_c = 1, D_c = 1, h = H, s_m = 1 - T, costs = delta*Cfixed + (1+alpha)*Cfuel,
     household requirement = Cfamily * H.
     """
 
     def test_kernel_reproduces_v1(self):
-        H, T, Cf, W, Cfx, d, Cfu, al, eta = 8, 0.85, 44.80, 65.63, 80.0, 1.10, 160.0, 0.02, 0.95
-        v1 = legacy_v1.run_monte_carlo(H, T, Cf, W, Cfx, d, Cfu, al, 0.33, 1.45, 19.47, eta, 7282.35, 8900.65, 100_000)
+        H, T, Cf, W, Cfx, d, Cfu, al, eta = 8, .8, 90., 100., 1200., 1.1, 800., .02, .9
+        v1 = legacy_v1.run_monte_carlo(H, T, Cf, W, Cfx, d, Cfu, al, 5.0, 20.0, 60.0, eta, 5000.0, 6000.0, 100_000)
         K = d * Cfx + (1 + al) * Cfu
         n = len(v1["Gf_array"])
         k = accounting_kernel(v1["Gf_array"], np.full(n, eta), v1["Pg_array"], np.full(n, K), np.full(n, K),
@@ -379,13 +377,13 @@ class TestLegacyRegression(unittest.TestCase):
 
     def test_v1_family_cost_threshold_is_not_the_wage_threshold(self):
         """Documents the V1.0 flaw: its 'required yield' (family-inclusive) differs from the wage threshold."""
-        H, T = 8, 0.85
-        v1 = legacy_v1.run_monte_carlo(H, T, 44.80, 65.63, 80.0, 1.10, 160.0, 0.02, 0.33, 1.45, 19.47, 0.95,
-                                       7282.35, 8900.65, 50_000)
+        H, T = 8, 0.8
+        v1 = legacy_v1.run_monte_carlo(H, T, 90.0, 100.0, 80.0, 1.10, 160.0, 0.02, 5.0, 20.0, 60.0, 0.95,
+                                       5000.0, 6000.0, 50_000)
         K = 1.10 * 80 + 1.02 * 160
         n = len(v1["Gf_array"])
         k = accounting_kernel(v1["Gf_array"], np.full(n, 0.95), v1["Pg_array"], np.full(n, K), np.full(n, K),
-                              s_m=0.15, L=8.0, W_opp=65.63, B_HH=44.80 * 8)
+                              s_m=0.2, L=8.0, W_opp=100.0, B_HH=90.0 * 8)
         self.assertFalse(np.allclose(k["Y_HH"], k["Y_W"]))
 
 

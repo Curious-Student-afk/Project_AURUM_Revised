@@ -4,7 +4,7 @@ ablation.py -- V1.0 -> V2.0 ablation study for Project AURUM.
 QUESTION: which of V1.0's flaws changed the answer, and by how much?
 
 Four complementary views (each fix is a switch, everything else held fixed):
-  1. FORWARD CHAIN  : start from V1.0 as run, add fixes one at a time, cumulatively  (S0 ... S8)
+  1. FORWARD CHAIN  : start from V1.0 synthetic reference, add fixes one at a time, cumulatively  (S0 ... S8)
   2. SOLO           : V1.0 plus ONE fix only                                          (order-free)
   3. LEAVE-ONE-OUT  : the full V2.0 model with ONE fix reverted/removed               (order-free)
   4. SENSITIVITY    : the full model under alternative values of the ASSUMED parameters
@@ -15,9 +15,8 @@ Headline metric: P(E < W_opp)  = "probability of labor return below the wage ben
 (1 - this = V1.0's "Probability of Real Economic Sustainability").
 
 HOW TO READ THE RESULTS
-  * These are SCENARIO results under the assumptions in ASSUME below. They are not findings about
-    Pantukan miners. Several fixes (zero-yield, jackpot, cost spread, dependence) can only be
-    switched on with ASSUMED values because the pilot did not collect them.
+  * These are SCENARIO results from independently constructed synthetic inputs.
+    The comparison exercises the fixed-timing equations; it does not evaluate batch timing.
   * Fixes are bundled where V1.0 bundles them (e.g. V1.0's lognormal and its heuristic "jackpot"
     cannot be separated); the step descriptions say so.
   * Random streams are separate per component (SeedSequence.spawn), so switching one component on or
@@ -44,30 +43,16 @@ import pandas as pd  # noqa: E402
 from scipy import stats  # noqa: E402
 
 import engine_v2 as E2  # noqa: E402
+from scenarios import legacy_synthetic_values
 import legacy_v1  # noqa: E402
 
 # --------------------------------------------------------------------------------------
-# Benchmark = the V1.0 dashboard run reproduced from the screenshots (per-person inputs)
+# Synthetic per-person benchmark for the V1 equations.
 # --------------------------------------------------------------------------------------
-BENCH = dict(H=8.0, T=0.85, Cfamily=44.80, W=65.63, Cfixed=80.0, delta=1.10, Cfuel=160.0, alpha=0.02,
-             eta=0.95, Gmin=0.33, Gsub=1.45, Gjack=19.47, Pmin=7282.35, Pmax=8900.65)
-
-# Values the pilot did NOT collect (or that V1.0 never had). Change them here, in one place.
-ASSUME = dict(
-    n_c=5,              # crew size behind V1.0's manual "divide by 5"            [assumed]
-    s_group=0.658,      # miner-group share = 1 - 0.342 (pilot mean tribute)       [pilot]
-    p0=0.10,            # zero-yield (waste) cycle probability                     [assumed]
-    pi_J=0.01,          # probability a productive cycle is a jackpot              [assumed]
-    jack_threshold=14.4, jack_cap=24.0,   # lowest / highest reported jackpot (g) [pilot, n = 3]
-    jack_shape=1.5,     # Pareto tail index                                        [assumed]
-    mode_frac=0.40,     # ordinary-yield PERT mode at min + 0.40*(max-min)         [assumed]
-    price_mode_frac=0.50,  # price PERT mode at the midpoint of the V1.0 range     [assumed]
-    cost_lo=0.8, cost_hi=1.2,   # cost PERT = (lo*m, m, hi*m); mean-preserving     [assumed]
-    rho=0.5,            # Spearman correlation between the two stochastic costs   [assumed]
-)
-PROVENANCE = {"n_c": "assumed", "s_group": "pilot", "p0": "assumed", "pi_J": "assumed",
-              "jack_threshold/cap": "pilot (n=3 respondents)", "jack_shape": "assumed", "mode_frac": "assumed",
-              "price_mode_frac": "assumed", "cost_lo/cost_hi": "assumed", "rho": "assumed"}
+BENCH = {k: v for k, v in legacy_synthetic_values().items() if k != "N"}
+ASSUME = dict(n_c=4, s_group=.5, p0=.1, pi_J=.02, jack_threshold=30., jack_cap=60.,
+              jack_shape=1.5, mode_frac=.4, price_mode_frac=.5, cost_lo=.8, cost_hi=1.2, rho=.5)
+PROVENANCE = {key: "synthetic" for key in ASSUME}
 
 STREAMS = ("yield", "hurdle", "jackstate", "jackmag", "price", "costs")
 
@@ -75,7 +60,7 @@ STREAMS = ("yield", "hurdle", "jackstate", "jackmag", "price", "costs")
 @dataclass(frozen=True)
 class Cfg:
     label: str = ""
-    labor: str = "v1_manual"          # "v1_manual" (share 0.15, divide by H) | "explicit" (0.658, n_c*H)
+    labor: str = "v1_manual"          # "v1_manual" (per-person inputs) | "explicit" (group inputs, n_c*H)
     eta: str = "v1_double"            # "v1_double" (eta on a farmgate price) | "once" (q = 1)
     yield_model: str = "v1_lognormal"  # "v1_lognormal" | "pert"
     price_model: str = "v1_lognormal"  # "v1_lognormal" | "pert"
@@ -84,8 +69,8 @@ class Cfg:
     costs: str = "deterministic"      # "deterministic" | "independent" | "copula"
 
 
-V1 = Cfg(label="S0  V1.0 as run")
-FULL = Cfg(label="Full V2.0 model", labor="explicit", eta="once", yield_model="pert", price_model="pert",
+V1 = Cfg(label="S0  V1.0 synthetic reference")
+FULL = Cfg(label="Full fixed-timing model", labor="explicit", eta="once", yield_model="pert", price_model="pert",
            p0=ASSUME["p0"], jackpot="tail", costs="copula")
 
 # --------------------------------------------------------------------------------------
@@ -164,7 +149,7 @@ def simulate(cfg: Cfg, N: int, seed: int = 42, A: Optional[dict] = None) -> Dict
     C = c1 + c2
 
     # ---- labour & share ----
-    if cfg.labor == "v1_manual":      # V1.0 as run: per-person conversion done by hand, share rounded to 0.15
+    if cfg.labor == "v1_manual":      # Synthetic per-person V1 inputs
         s, L, C = 1.0 - min(b["T"], 0.99), b["H"], C / A["n_c"]
     else:                             # explicit group accounting
         s, L = A["s_group"], A["n_c"] * b["H"]
@@ -196,14 +181,14 @@ def _delta(a: dict, b: dict):
 # --------------------------------------------------------------------------------------
 FIXES = [  # (key, short name, description, how to turn it ON starting from V1.0 / how to turn it OFF from FULL)
     ("labor", "Person-hour accounting",
-     "Explicit group accounting (n_c people, unrounded share 0.658) instead of manual /5 with the share rounded to 0.15",
+     "Explicit crew person-hours and group share versus the synthetic per-person V1 inputs",
      dict(labor="explicit"), dict(labor="v1_manual")),
     ("eta", "Purity counted once",
-     "q = 1 on a farmgate price (V1.0 multiplied eta = 0.95 onto a price that already embeds grade)",
+     "q = 1 on a farmgate price (V1.0 multiplied eta = 0.9 onto a price that already embeds grade)",
      dict(eta="once"), dict(eta="v1_double")),
     ("yield", "Beta-PERT yield",
      "Beta-PERT (same min/max, assumed mode) replaces the hidden-percentile lognormal; for V1.0 it also removes V1.0's "
-     "heuristic 0.2% 'jackpot' (the two are inseparable)",
+     "heuristic 'jackpot' (the two are inseparable)",
      dict(yield_model="pert", jackpot="off"), dict(yield_model="v1_lognormal")),
     ("price", "Beta-PERT price",
      "Beta-PERT (same bounds, midpoint mode) replaces the hidden-percentile lognormal price",
@@ -211,7 +196,7 @@ FIXES = [  # (key, short name, description, how to turn it ON starting from V1.0
     ("zero", "Zero-yield hurdle", "Waste cycles with Y = 0 at probability p0 (assumed)",
      dict(p0=ASSUME["p0"]), dict(p0=0.0)),
     ("jackpot", "Jackpot tail",
-     "Truncated-Pareto jackpot on [14.4, 24] g at probability pi_J (assumed)",
+     f"Truncated-Pareto jackpot on [{ASSUME['jack_threshold']}, {ASSUME['jack_cap']}] g at probability pi_J (synthetic)",
      dict(jackpot="tail"), dict(jackpot="off")),
     ("costs", "Stochastic costs",
      "Costs become mean-preserving PERT draws (spread assumed), independent",
@@ -226,7 +211,7 @@ CHAIN_ORDER = ["labor", "eta", "yield", "price", "zero", "jackpot", "costs", "de
 def forward_chain(N, seed, A=None) -> pd.DataFrame:
     fx = {f[0]: f for f in FIXES}
     cfg, rows, prev, first = V1, [], None, None
-    r = {"step": "S0", "change": "V1.0 as run (frozen code, benchmark inputs)", **run_cfg(cfg, N, seed, A)}
+    r = {"step": "S0", "change": "V1.0 synthetic reference (frozen code, benchmark inputs)", **run_cfg(cfg, N, seed, A)}
     first = prev = r
     r["d_prev_pp"] = r["d_prev_se"] = r["d_v1_pp"] = r["d_v1_se"] = np.nan
     rows.append(r)
@@ -300,7 +285,7 @@ def mode_frac_matching_v1_mean(N: int = 200_000) -> float:
 
 
 def v1_literal_diagnostic(N) -> dict:
-    """What V1.0's equation gives if the GROUP-level inputs are fed in without the manual /5 conversion."""
+    """What V1.0's equation gives if the GROUP-level inputs are fed in without the crew-size conversion."""
     b = BENCH
     v1 = legacy_v1.run_monte_carlo(
         H=b["H"], T=1 - ASSUME["s_group"], Cfamily=b["Cfamily"], opportunity_wage=b["W"],
@@ -407,8 +392,8 @@ def build_report(fwd, sol, loo, seeds, sens, diag, N, seed) -> str:
 *Generated {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')} · N = {N:,} draws per configuration · seed {seed} · engine {E2.ENGINE_VERSION}*
 
 **Read this first.** Everything below is a **scenario result under the assumptions listed at the end**. It is not a finding
-about Pantukan miners. The pilot did not collect crew size, costs, zero-yield counts, jackpot frequency, a yield mode, or
-dependence, so those fixes can only be switched on with assumed values. Headline metric: **P(E < W)**, the probability
+about any real mining group. All parameters are synthetic. This study compares fixed-timing
+equations and does not evaluate the daily batch schedule extension. Headline metric: **P(E < W)**, the probability
 that the labor return per person-hour is below the {BENCH['W']} PHP/hour wage benchmark (V1.0 reported 1 − this as
 "Probability of Real Economic Sustainability").
 
@@ -421,7 +406,7 @@ that the labor return per person-hour is below the {BENCH['W']} PHP/hour wage be
 {md_table(s, {"P(E<W) %": ".1f", "Δ vs V1.0 (pp)": "+.1f", "SE (pp)": ".2f"})}
 
 ## 3. Leave-one-out from the full model (order-free, ranked by size of effect)
-Full V2.0 model: P(E<W) = {pct(full['p_wage_below']):.1f}%.
+Full fixed-timing model: P(E<W) = {pct(full['p_wage_below']):.1f}%.
 {md_table(l, {"P(E<W) %": ".1f", "Δ vs full (pp)": "+.1f", "SE (pp)": ".2f"})}
 
 ## 4. Noise check (full model, 5 seeds)
@@ -433,18 +418,18 @@ P(E<W) ranges {pct(seeds['p_wage_below'].min()):.1f}%–{pct(seeds['p_wage_below
 
 ## 6. Diagnostic: V1.0's equation on un-converted group inputs
 If the group-level inputs (group yield, group costs, miner share {ASSUME['s_group']}) had been fed to V1.0's equation
-**without** the manual ÷5 step, V1.0 would give P(E<W) = {pct(diag['p_wage_below']):.1f}%
+**without** the crew-size conversion, V1.0 would give P(E<W) = {pct(diag['p_wage_below']):.1f}%
 (mean E = {diag['E_mean']:.0f} PHP/h) because H, not person-hours, would divide a group-level numerator. The manual
-conversion avoided this, but it was undocumented and the share was rounded (0.1316 → 0.15).
+conversion changes the accounting unit. Both parameter sets here are synthetic examples.
 
 ## 7. What this does and does not show
 * It shows which V1.0 flaws are **large** and which are **small** under these assumptions, and in which direction each moves the answer.
 * **The size of the PERT-yield step is mostly the assumed mode, not a measured V1.0 error.** With the mode at {mm:.0%} of the
   min–max range, Beta-PERT has the same mean yield as V1.0, and that step shrinks toward zero (section 5, parameter mode_frac).
-  The pilot has no "usual" value, so which mode is right is unknown. Report the whole range, not one number.
+  The mode is an illustrative input; report its sensitivity range.
 * Stochastic costs and dependence barely move P(E<W) here because costs are small next to revenue and the assumed spreads are
   modest; they remain required by the specification and are verified in the test suite.
-* The absolute level of P(E<W) depends strongly on the assumed crew size (see section 5) and on yield inputs that are provisional.
+* The absolute level of P(E<W) depends strongly on the assumed crew size (see section 5) and on synthetic yield assumptions.
 * S3 bundles V1.0's lognormal with its heuristic jackpot; S4 changes the mean price as well as the shape (the lognormal with
   min = P5 and max = P99 has a lower mean than a mid-mode PERT on the same bounds). Both are real V1.0 effects of the hidden
   calibration, but they are not pure "shape only" changes.
@@ -452,12 +437,12 @@ conversion avoided this, but it was undocumented and the share was rounded (0.13
   they are verified in the test suite instead.
 * No empirical validation is implied (Domain G needs Phase 2 field data).
 
-## Assumed / pilot parameters used
+## Assumed / synthetic parameters used
 | Parameter | Value | Provenance |
 |---|---|---|
 {assume_rows}
 
-Benchmark (V1.0 inputs reproduced from the dashboard screenshots): {json.dumps(BENCH)}
+Synthetic V1.0 benchmark: {json.dumps(BENCH)}
 """
 
 

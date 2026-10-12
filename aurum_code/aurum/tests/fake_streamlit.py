@@ -109,7 +109,7 @@ class Fake:
     dataframe = _disp("dataframe"); pyplot = _disp("pyplot"); download_button = _disp("download_button")
 
     # ---- widgets ----
-    def number_input(self, label, min_value=None, max_value=None, value=0, step=None, key=None, help=None, format=None):
+    def number_input(self, label, min_value=None, max_value=None, value=0, step=None, key=None, help=None, format=None, disabled=False):
         self._register(key)
         ok, ov = self._override(key)
         _check_numeric(label, value, min_value, max_value, step, ok)

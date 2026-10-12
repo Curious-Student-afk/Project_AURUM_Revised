@@ -13,12 +13,12 @@ import pandas as pd
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 import engine_v2 as E
 import dashboard_logic as DL
-from scenarios import pilot_provisional
+from scenarios import fixed_synthetic
 
 
 def scenario(**kw):
-    """Return the pilot-provisional Inputs with the given fields overridden."""
-    return dataclasses.replace(pilot_provisional(), **kw)
+    """Return the synthetic Inputs with the given fields overridden."""
+    return dataclasses.replace(fixed_synthetic(), **kw)
 
 
 def deterministic(**kw):
@@ -100,7 +100,7 @@ class TestValidationBoundary(unittest.TestCase):
 
     def test_dashboard_does_not_truncate_counts_or_coerce_bad_numbers(self):
         """The dashboard layer forwards bad numbers to the engine instead of coercing them."""
-        defaults = DL.preset_values(DL.PRESETS[0])
+        defaults = {**DL.preset_values(DL.PRESETS[0]), 'timing_mode': 'fixed', 'explosives_basis': 'per_batch'}
         for key, value in (('n_c', 5.4), ('D_c', 1.5), ('n_hh', True), ('p_min', '100'),
                            ('seed', 2.5), ('n_max', 100.5), ('tol', True)):
             with self.subTest(key=key), self.assertRaises(E.InputError):
@@ -197,10 +197,10 @@ class TestReserveAccounting(unittest.TestCase):
         revenue = np.random.default_rng(12).uniform(100, 1e6, 10000)
         for location in ('before_sharing', 'after_sharing'):
             a = E.accounting_kernel(revenue, np.ones(10000), np.ones(10000),
-                    np.zeros(10000), np.zeros(10000), s_m=.658, L=40., W_opp=65., B_HH=1075.,
+                    np.zeros(10000), np.zeros(10000), s_m=.55, L=40., W_opp=100., B_HH=800.,
                     reserve_mode='custom', reserve_custom_per_cycle=1e6,
                     reserve_location=location, reserve_priority='household_first')
-            np.testing.assert_array_equal(a['cash_before_reserve'] >= 1075., a['cash_after_reserve'] >= 1075.)
+            np.testing.assert_array_equal(a['cash_before_reserve'] >= 800., a['cash_after_reserve'] >= 800.)
 
     def test_match_depreciation_respects_fund_and_contract(self):
         """match_depreciation targets the correct amount for the selected fund and tribute base."""
