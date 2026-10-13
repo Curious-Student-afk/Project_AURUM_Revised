@@ -18,12 +18,14 @@ N = 60_000
 
 class TestSwitches(unittest.TestCase):
     def test_s0_is_exactly_frozen_v1(self):
+        """Configuration S0 (V1) reproduces the frozen legacy V1.0 draws and success rate exactly."""
         res = AB.simulate(AB.V1, N)
         v1 = AB.v1_draws(N)
         np.testing.assert_allclose(res["E"], v1["hourly_efficiency_array"], rtol=1e-12)
         self.assertAlmostEqual(1 - AB.metrics(res)["p_wage_below"], v1["success_rate"] / 100, places=12)
 
     def test_chain_ends_at_full_model(self):
+        """Applying every fix in CHAIN_ORDER to V1 reaches exactly the FULL configuration."""
         cfg = AB.V1
         fx = {f[0]: f for f in AB.FIXES}
         for key in AB.CHAIN_ORDER:
@@ -31,20 +33,24 @@ class TestSwitches(unittest.TestCase):
         self.assertEqual(dataclasses.replace(cfg, label=""), dataclasses.replace(AB.FULL, label=""))
 
     def test_inseparable_v1_jackpot_is_guarded(self):
+        """Combining V1's heuristic jackpot with a PERT yield model raises, since the two cannot be separated."""
         with self.assertRaises(ValueError):
             AB.simulate(dataclasses.replace(AB.V1, yield_model="pert"), 1000)   # pert + v1 heuristic jackpot
 
     def test_explicit_labor_lowers_return_every_draw(self):
+        """Switching to explicit group-labor accounting lowers the return on every draw."""
         a = AB.simulate(AB.V1, N)["E"]
         b = AB.simulate(dataclasses.replace(AB.V1, labor="explicit"), N)["E"]
-        self.assertTrue(np.all(b < a))             # 0.658/5 = 0.1316 < rounded 0.15 on every draw
+        self.assertTrue(np.all(b < a))             # group share / crew is below the synthetic V1 share on every draw
 
     def test_purity_once_raises_return_every_draw(self):
+        """Counting purity once instead of twice raises the return on every draw."""
         a = AB.simulate(AB.V1, N)["E"]
         b = AB.simulate(dataclasses.replace(AB.V1, eta="once"), N)["E"]
         self.assertTrue(np.all(b > a))
 
     def test_hurdle_share_and_common_random_numbers(self):
+        """The zero-yield hurdle hits the target share, and positive draws match the no-hurdle run exactly (CRN)."""
         no0 = AB.simulate(dataclasses.replace(AB.FULL, p0=0.0), N)["Y"]
         with0 = AB.simulate(AB.FULL, N)["Y"]
         zero_share = np.mean(with0 == 0)
@@ -53,6 +59,7 @@ class TestSwitches(unittest.TestCase):
         np.testing.assert_array_equal(with0[pos], no0[pos])      # other components' draws undisturbed
 
     def test_jackpot_toggle_leaves_ordinary_draws_untouched(self):
+        """Toggling the jackpot tail on only changes the rare cycles that actually hit the jackpot threshold."""
         off = AB.simulate(dataclasses.replace(AB.FULL, jackpot="off", p0=0.0), N)["Y"]
         on = AB.simulate(dataclasses.replace(AB.FULL, jackpot="tail", p0=0.0), N)["Y"]
         same = on == off
@@ -60,17 +67,20 @@ class TestSwitches(unittest.TestCase):
         self.assertTrue(np.all(on[~same] >= AB.ASSUME["jack_threshold"]))
 
     def test_copula_with_zero_rho_equals_independent(self):
+        """A copula with rho = 0 produces exactly the same draws as independent costs."""
         a = AB.simulate(dataclasses.replace(AB.FULL, costs="independent"), N)["E"]
         b = AB.simulate(dataclasses.replace(AB.FULL, costs="copula"), N, A={"rho": 0.0})["E"]
         np.testing.assert_array_equal(a, b)
 
     def test_dependence_widens_total_cost_but_not_its_mean(self):
+        """Positive cost dependence widens the spread of total cost while preserving its mean."""
         ind = AB.simulate(dataclasses.replace(AB.FULL, costs="independent"), 200_000)["C"]
         dep = AB.simulate(AB.FULL, 200_000)["C"]
         self.assertGreater(dep.std(), ind.std())
         self.assertAlmostEqual(dep.mean(), ind.mean(), delta=3.0)   # mean-preserving PERT spread
 
     def test_reproducible_and_seed_sensitive(self):
+        """The same seed reproduces identical draws; a different seed produces different draws."""
         a, b = AB.simulate(AB.FULL, N, seed=3), AB.simulate(AB.FULL, N, seed=3)
         c = AB.simulate(AB.FULL, N, seed=4)
         np.testing.assert_array_equal(a["E"], b["E"])
@@ -79,25 +89,30 @@ class TestSwitches(unittest.TestCase):
 
 class TestStudyDesign(unittest.TestCase):
     def test_leave_one_out_matches_forward_step_when_same_config(self):
+        """Reverting 'Cost dependence' from the full model matches the forward chain's step before it was added."""
         fwd = AB.forward_chain(N, 42)
         loo = AB.leave_one_out(N, 42)
         row = loo[loo["fix_reverted"] == "Cost dependence"].iloc[0]
         self.assertEqual(row["p_wage_below"], fwd.loc[fwd["step"] == "S7", "p_wage_below"].iloc[0])
 
     def test_loo_sorted_by_effect_and_complete(self):
+        """The leave-one-out table covers every fix and is sorted by decreasing absolute effect size."""
         loo = AB.leave_one_out(N, 42)
         self.assertEqual(len(loo), len(AB.FIXES))
         self.assertTrue(loo["d_full_pp"].abs().is_monotonic_decreasing)
 
     def test_solo_has_one_row_per_fix(self):
+        """The solo table has exactly one row per fix."""
         self.assertEqual(len(AB.solo(N, 42)), len(AB.FIXES))
 
     def test_sensitivity_has_exactly_one_primary_per_parameter(self):
+        """Each swept parameter in the sensitivity grid has exactly one row flagged as the primary assumption."""
         s = AB.sensitivity(20_000, 42)
         for name, grp in s.groupby("parameter"):
             self.assertEqual(int(grp["is_primary_assumption"].sum()), 1, msg=name)
 
     def test_mode_matching_value_reproduces_v1_mean_yield(self):
+        """The mode fraction returned by mode_frac_matching_v1_mean() gives a PERT with V1.0's mean yield."""
         f = AB.mode_frac_matching_v1_mean(200_000)
         a, b = AB.BENCH["Gmin"], AB.BENCH["Gsub"]
         pert_mean = E2.PERT(a, a + f * (b - a), b).mean
@@ -134,6 +149,7 @@ class TestStudyDesign(unittest.TestCase):
 
 class TestOutputs(unittest.TestCase):
     def test_main_writes_all_files_with_honest_framing(self):
+        """main() writes every expected output file and the report uses honest, non-directive framing."""
         with tempfile.TemporaryDirectory() as d:
             AB.main(["--n", "20000", "--out", d])
             for f in ("ablation_forward.csv", "ablation_solo.csv", "ablation_leave_one_out.csv",
@@ -144,6 +160,7 @@ class TestOutputs(unittest.TestCase):
                 txt = fh.read()
             self.assertIn("scenario result", txt.lower())
             self.assertIn("Detectable?", txt)
+            self.assertIn(f"[{AB.ASSUME['jack_threshold']}, {AB.ASSUME['jack_cap']}] g", txt)
             self.assertNotIn("poverty", txt.lower())
 
 

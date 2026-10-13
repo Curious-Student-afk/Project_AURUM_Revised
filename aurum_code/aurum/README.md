@@ -1,109 +1,149 @@
-# Project AURUM — Engine V2.1 (draft)
+# Project AURUM — Engine V2.2 (draft)
 
-| File | Role |
-|---|---|
-| `legacy_v1.py` | **Frozen** V1.0 simulation function (do not edit). Baseline for the regression test and Chapter 3.1. |
-| `engine_v2.py` | V2.0 engine: zero-aware hurdle + PERT + truncated-Pareto jackpot, group-level cycle accounting, three separate thresholds, Spearman-copula costs, MCSE stopping rule, run manifest. No Streamlit. |
-| `scenarios.py` | Named input sets (pilot-provisional baseline; synthetic Baseline / High-Cost / Low-Purity). Every value carries a provenance tag. |
-| `tests/test_engine_v2.py` | 44 acceptance tests mapped to the expert report. |
-| `tests/test_ablation.py` | 18 tests that the ablation switches do exactly what they claim (92 tests in total with the dashboard tests). |
-| `ablation.py` | V1.0 -> V2.0 ablation study: forward chain, each fix alone, leave-one-out, seed-noise check, sensitivity to assumed parameters, V1.0 diagnostic, figures and a Markdown report. |
-| `ablation_out/` | Example outputs (N = 500,000, seed 42). Re-run to reproduce. |
-| `run_demo.py` | Offline demo; writes run manifests to `runs/`. |
-| `app.py` | Streamlit dashboard (V2.0 default, frozen V1.0 for comparison). Thin layer over the modules below. |
-| `dashboard_logic.py` | Everything the dashboard does except draw widgets: inputs mapping, provenance tags, tables, figures, exports, wording. No Streamlit import, so it is unit-tested. |
-| `tests/test_dashboard.py`, `tests/fake_streamlit.py` | Dashboard logic tests plus an offline smoke test of `app.py` against a fake Streamlit. |
-| `requirements.txt` | numpy, scipy, pandas, matplotlib, streamlit. |
+One Monte Carlo iteration represents a complete production batch. All presets are independently
+constructed **synthetic demonstrations**, not measured mining conditions. Tests verify software
+behavior; empirical validation requires independently obtained observations.
 
-## Run (offline, Python 3.11+, needs numpy, scipy, pandas, matplotlib, streamlit)
-```
+## Run locally
+
+Python 3.11+ is required. From this directory:
+
+```bash
+python -m pip install -r requirements.txt
 python -m unittest discover -s tests -v
+python tests/streamlit_smoke.py
 python run_demo.py
-python ablation.py --n 500000 --seed 42 --out ablation_out
 streamlit run app.py
 ```
 
-## Read before using any number
-* Outputs are **scenario results under stated assumptions**, not findings about Pantukan miners.
-* Not collected in the pilot (so ASSUMED): crew size, costs, p0, pi_J, PERT mode, dependence, tribute base.
-* Pilot yield bounds (a, b) are means of respondents' typical min/max: provisional. Jackpot inputs rest on n = 3.
-* Set `W_opp_source` / `W_opp_date` before reporting (the engine warns until you do).
-* Dependence is modelled among cost categories only; yield–cost dependence is a stated limitation.
-* Passing tests = **verification** (code matches specification). Empirical **validation** (Domain G) needs Phase 2 data.
+`engine_v2.py` contains pure NumPy/SciPy sampling and accounting. `dashboard_logic.py` maps inputs,
+formats results, and exports CSV/JSON without importing Streamlit. `app.py` draws the dashboard.
+`scenarios.py` supplies synthetic examples. `legacy_v1.py` retains the V1 numerical equations for
+comparison only. `ablation.py` compares fixed-timing equations using independent synthetic inputs;
+it does not evaluate the daily batch schedule extension.
 
-## Reading the ablation (important)
-* The size of the "Beta-PERT yield" step is mostly the **assumed mode** (no 'usual' value was collected), not a measured V1.0 error.
-  With the mode at about 19% of the min-max range, PERT has the same mean yield as V1.0 and that step nearly vanishes.
-* Crew size (assumed 5) moves the headline probability more than any single fix. Report the full range.
-* Stochastic costs and cost dependence do not move P(E<W) in this scenario; they remain required by the specification.
-* Change the assumed values in one place: the `ASSUME` dictionary at the top of `ablation.py`.
+To generate a new synthetic ablation report:
 
-## Dashboard: what was and was not verified
-* Verified offline: the input mapping (UI values -> engine inputs gives identical simulations), provenance tags, tables,
-  figures, exports, wording rules (no "debt trap", no exit/greenlight advice), the legacy path, and that `app.py` runs end to end
-  against a fake Streamlit that enforces common argument rules (mixed int/float, duplicate keys, out-of-range defaults).
-* Verified for V2.1: real Streamlit AppTest initial/default runs, fractional calendar duration,
-  required reserve-policy errors, all eight sharing/location/priority combinations, purchased-equipment
-  depreciation reserves, and invalid-yield clearing. A shared Chromium smoke check exercised the
-  default run and a custom common reserve with household-first allocation and 2.5 calendar days.
-* Stakeholder usability and exhaustive browser/device coverage remain unverified.
-* Scenario results only: every screen says so; inputs tagged 🟠 are assumptions.
+```bash
+python ablation.py --n 500000 --seed 42 --out ablation_out
+```
 
-## V2.1 accounting update
+Generated reports, run manifests, and bytecode are excluded from Git. Saved reports must be regenerated
+when inputs or code change. Requirements are currently unpinned; each manifest records runtime versions.
 
-`Pi` and `E` retain their economic-profit meanings, including depreciation. `Y_HH` and
-`P_fail_household_adequacy` also retain their economic-profit basis and are labeled explicitly.
-New cash outputs exclude purchased-equipment depreciation; equipment rentals remain cash expenses.
-The frozen V1 code and the distributions/cost copula are unchanged.
+## Timing and production
 
-### Calendar period
+`Inputs.batch_timing` accepts `BatchTiming(work_days, idle_days, shift_counts, hours_by_shifts)`.
 
-Set `calendar_days_per_cycle` to the positive elapsed household expense/income period covered by
-this cycle, including idle time; fractional days are allowed. `D_c` remains the working-shift count
-for person-hours and rentals. Old inputs omitting calendar duration use `D_c`; a warning and the
-manifest's `calendar_days_assumed_from_shifts` flag disclose that fallback. Current presets specify
-one calendar day explicitly. Household count remains independent of crew size when supplied.
+- Working days use standard Beta-PERT (shape weight 4), rounded by `floor(draw + 0.5)`.
+  Bounds and mode are whole numbers from 1 to 3650. This computational limit bounds scheduling work.
+- Idle days use independent continuous nonnegative Beta-PERT. Calendar days equal working plus idle days.
+- `shift_counts` contains three nonnegative integer counts for 1, 2, and 3 shifts, totaling ten working days.
+  Each working day independently draws a categorical shift count using these frequencies.
+- `hours_by_shifts` maps 1, 2, and 3 to conditional PERTs. One duration is drawn per day and applies to
+  every shift that day. All registered workers attend. Bounds are at least 0.5 and at most
+  `min(16, 24 / shift_count)` hours. Dashboard bounds use 0.25-hour increments; draws remain continuous.
+- Total shifts are summed over days. Operating hours sum scheduled shift durations, without multiplying
+  by crew size. Person-hours equal crew size times operating hours. No worker rotation is modeled.
+- Yield, zero-yield counts, jackpot frequency and capacity are elicited per completed batch. Batch yield
+  is never multiplied by shift count. Jackpot probability is conditional on a productive batch; its
+  magnitude uses a truncated Pareto with a lower threshold, cap, and positive shape.
+- Batch yield, valuation, and timing are independent in this model. Timing has a separate seeded random
+  stream. Results are reproducible given inputs, seed, batching configuration, code, and runtime versions.
 
-### Replacement reserve (one cycle only)
+Farmgate pricing values recovered gold directly (`q=1`, a valuation convention). Reference pricing
+uses physical purity and reports fine gold mass. Both price and reference purity can use bounded PERT.
 
-`reserve_mode` is `none` (default), `match_depreciation`, or `custom`. When enabled, explicitly set
-`reserve_location` to `before_sharing` or `after_sharing`, and `reserve_priority` to
-`household_first` or `reserve_first`. A custom target is `reserve_custom_per_cycle` (PHP >= 0).
-Matching depreciation targets total depreciation for a common fund, or effective miner depreciation
-for a miner fund (direct allocation under gross sharing, proportional allocation under net sharing).
+## Expenses and dependence
 
-Let R be gross revenue, C the total cash operating cost, M the effective miner cash cost,
-s the miner revenue share, B the household requirement, and Q the reserve target. Miner cash
-before the reserve is X = s*R - M. Existing gross/net rules determine M and economic profit.
+`CostItem.basis` specifies the units of its fixed amount or PERT rate:
 
-| Fund | Available funding A | Miner burden per peso funded b |
+| Basis | Exposure |
+|---|---|
+| `per_batch` (default) | 1 |
+| `per_shift` | Total scheduled shifts |
+| `per_operating_hour` | Sum of scheduled shift durations |
+| `per_working_day` | Rounded active days |
+| `per_calendar_day` | Active plus idle days |
+
+All rates describe the whole operation/crew, not an individual worker. Each rate is sampled once per
+batch, then multiplied by its exposure. Default categories are fuel/hour, milling/batch,
+explosives/working day, transport/batch, and food/calendar day. Additional fixed overhead is optional.
+Worksite food is additional consumption excluded from the household benchmark.
+
+The existing Gaussian copula applies to expense rates before exposure scaling. The Spearman matrix
+is ordered by stochastic cost items; the dashboard labels each pair. It must be symmetric with a
+unit diagonal, and its Gaussian conversion must be positive definite. Degenerate PERT rates remain
+in that order, but have no measurable rank correlation. Realized expense correlations can differ
+from the rate targets because expenses also share time drivers. No rank reordering is performed.
+
+Rented equipment costs its per-shift rental rate times sampled shifts. Purchased equipment has
+per-batch depreciation `(acquisition - salvage) / life_cycles * utilization`. Depreciation is an
+economic cost and is excluded from cash costs. Equipment is included exactly once.
+
+## Three adequacy indicators
+
+Let `C_eff` be directly allocated miner costs under gross sharing, or the miner share of all costs
+under net sharing. Economic profit includes depreciation:
+
+- `Pi = s_m * Y * q * P - C_eff` and `E = Pi / L`.
+- Hourly wage adequacy compares `E` with `W_opp` (PHP/person-hour).
+- Household economic adequacy compares `Pi` with `B_HH = n_c * calendar_days * W_daily`.
+  `W_daily` is PHP per represented household per calendar day; batch mode assumes one household per
+  registered worker and no nonmining-income offset. Additional worksite food is excluded from this benchmark.
+- Household cash adequacy compares cash before and after reserve with the same draw's `B_HH`.
+
+The three yield thresholds remain distinct:
+
+- Operating break-even: `Y_BE = C_eff / (q * P * s_m)`.
+- Opportunity wage: `Y_W = (C_eff + W_opp * L) / (q * P * s_m)`.
+- **Household economic-adequacy yield threshold**: `Y_HH = (C_eff + B_HH) / (q * P * s_m)`.
+
+Benchmarks are normative inputs. Cite their source and effective date before using them in reporting.
+Provenance distinguishes synthetic demonstrations, stated assumptions, external sources, and user entries.
+
+## Single reserve fund
+
+`reserve_mode` is `none`, `match_depreciation`, or `custom` (which can represent an emergency fund).
+An enabled fund requires explicit `reserve_location` (`before_sharing` or `after_sharing`) and
+`reserve_priority` (`household_first` or `reserve_first`). There is no second fund, accumulated
+balance, borrowing, interest, equipment purchase payment, or accumulated debt.
+
+Let `R` be revenue, `C` cash operating cost, `M` effective miner cash cost, `s` miner share,
+`B` household need, and `Q` reserve target. Miner cash before reserve is `X = s*R - M`.
+
+| Fund | Available funding A | Miner burden b per peso funded |
 |---|---|---|
-| Before sharing (common) | max(R - C, 0) | s |
-| After sharing (miner) | max(X, 0) | 1 |
+| Common, before sharing | `max(R-C, 0)` | `s` |
+| Miner, after sharing | `max(X, 0)` | `1` |
 
-Reserve-first funds F = min(Q, A). Household-first funds
-F = min(Q, A, max((X - B)/b, 0)). Miner cash after reserve is X - b*F;
-shortfall is Q - F. Common funding reduces the revenue base available for sharing under either
-contract; the cash-cost allocation itself is unchanged. Household-first protects only the modeled
-miner households, not financier households. Losses remain visible and never finance reserve deposits.
-Depreciation is never deducted again from cash. There is no reserve balance, borrowing, interest,
-equipment purchase payment, or accumulated debt in this single-cycle model.
+Reserve-first funds `F=min(Q,A)`. Household-first funds `F=min(Q,A,max((X-B)/b,0))`.
+Cash after reserve is `X-b*F`, and reserve shortfall is `Q-F`. Household-first protects modeled miner
+households. Losses remain visible and cannot fund deposits. Depreciation is never subtracted again
+from cash. Matching depreciation targets total depreciation for a common fund and effective miner
+depreciation for a miner fund. With no reserve, the joint target probability equals household cash adequacy.
 
-Arrays and summaries expose cash before/after reserve, planned/funded/shortfall reserve amounts,
-and the miner contribution. Reserve amounts refer to the selected common/miner fund, while the
-miner contribution reports its effect on miner cash. New probabilities show household cash shortfall
-before/after reserve, reserve underfunding, and meeting both targets. With no reserve, the reserve
-target is zero and the joint probability equals household cash adequacy. Every reported probability
-participates in MCSE stopping and the staged convergence table. CSVs and manifests retain the old
-columns/keys and add the new outputs and policy. The engine/dashboard version is `2.1.0-draft`.
+## Fixed-timing compatibility and outputs
 
-### Validation and tail statistics
+Omitting `batch_timing` preserves the existing fixed shift/calendar/hours API, optional hours matrix,
+independent household count, and nonmining-income offset. Missing fixed calendar days retain the
+explicitly warned one-day-per-shift fallback. Fixed mode cannot price per working day because it
+has no working-day schedule. An hours matrix cannot price per operating hour because it does not
+define shared machine exposure. In fixed dashboard mode, select a supported expense basis for every category.
 
-The engine rejects non-finite or nonnumeric active inputs, boolean/fractional counts, malformed
-hours matrices, and invalid run settings. `n_max < n_min` remains an intentional capped run that
-reports non-convergence; all limits must be positive integers. Unexpected non-finite arithmetic
-raises `InputError` before event counting. MCSE is numerical simulation error, not model uncertainty.
-Expected shortfall averages exactly the lowest 5% of empirical probability mass, fractionally
-weighting the boundary observation rather than including every tie at the fifth percentile.
+Batch mode rejects conflicting calendar or hours-matrix inputs, nondefault fixed shifts/hours,
+a household count differing from crew size, and nonzero nonmining income. Scalar timing helper
+methods raise `InputError` in batch mode; consume result arrays instead.
 
-Checks: `python -m unittest discover -s tests -v` and `python tests/streamlit_smoke.py`.
+Both modes export draw-specific calendar days, shifts, operating hours, person-hours, household
+requirements, expense rates, expense totals, cash/reserves, returns, and thresholds. Batch mode
+also exports active and idle days. Means and medians have explicit `_mean`/`_median` keys. Original
+scalar `L_person_hours`, `B_HH`, and `calendar_days_per_cycle` summaries exist only in fixed mode.
+For a fixed hours matrix, the compatibility `operating_hours` value uses fixed shifts × fixed hours;
+it is not inferred from individual attendance and cannot drive operating-hour expenses.
+
+Manifests include inputs and code hashes, version, units, matrix order, schedule rules, provenance,
+assumptions, and run configuration. `F` remains the valuation-mass array; its physical label follows
+price basis. Per-draw economic and cash probabilities participate in every convergence stage and
+MCSE stopping decision. MCSE is numerical sampling error, not model uncertainty. Expected shortfall
+uses exactly the lowest 5% of empirical probability mass, including fractional boundary weight.

@@ -16,15 +16,17 @@ import streamlit as st
 import dashboard_logic as DL
 import engine_v2 as E2
 
-VERSIONS = ["V2.0 (current)", "V1.0 (legacy, frozen - comparison only)"]
+VERSIONS = ["V2.2 (current)", "V1.0 (legacy, frozen - comparison only)"]
 N_MAX_CHOICES = [50_000, 100_000, 200_000, 500_000]
 
 
 def _slug(text: str) -> str:
+    """Turn `text` into a widget-key-safe slug (alphanumerics kept, everything else becomes '_')."""
     return "".join(ch if ch.isalnum() else "_" for ch in text)
 
 
 def _show_fig(fig) -> None:
+    """Render a Matplotlib figure in Streamlit, then close it to release memory."""
     st.pyplot(fig)
     plt.close(fig)
 
@@ -38,105 +40,127 @@ def v2_form(preset: str) -> tuple:
     defaults = DL.preset_values(preset)
 
     def label(name: str, text: str) -> str:
+        """Widget label for `name`, suffixed with its current provenance tag."""
         cur = st.session_state.get(f"{ps}__{name}", defaults[name])
         return f"{text}  {DL.TAG_LABEL[DL.tag_for(name, cur, preset)]}"
 
     def num(name, text, help_text=None, **kw):
+        """Draw a tagged number_input widget bound to `name`."""
         return st.number_input(label(name, text), key=f"{ps}__{name}", help=help_text, **kw)
 
     def sld(name, text, help_text=None, **kw):
+        """Draw a tagged slider widget bound to `name`."""
         return st.slider(label(name, text), key=f"{ps}__{name}", help=help_text, **kw)
 
     def rad(name, text, options, help_text=None):
+        """Draw a tagged radio widget bound to `name`, defaulting to the preset's value."""
         return st.radio(label(name, text), options, index=options.index(defaults[name]), key=f"{ps}__{name}",
                         help=help_text)
 
     d = defaults
-    v = {}
+    v = dict(d)
+    for name, title, options in (("timing_mode", "Timing model", ["batch", "fixed"]),
+                                  ("price_basis", "Gold price basis", ["farmgate", "reference"]),
+                                  ("share_preset", "Miner/financier split", ["Custom", "50/50", "60/40", "65/35"])):
+        v[name] = st.sidebar.radio(label(name, title), options, index=options.index(d[name]), key=f"{ps}__{name}")
     with st.sidebar.form(key=f"form_{ps}"):
-        st.markdown("**1. Accounting unit and labour** (one production cycle, group level)")
-        v["n_c"] = num("n_c", "Active crew size n_c", "Not collected in the pilot. Drives person-hours and the result strongly.",
+        st.markdown("**1. Batch timing and labour**")
+        v["n_c"] = num("n_c", "Registered crew size", "Every registered worker attends every scheduled shift.",
                        min_value=1, max_value=100, value=int(d["n_c"]), step=1)
-        v["D_c"] = num("D_c", "Shifts per cycle D_c", "The pilot data are per shift, so a cycle = 1 shift.",
-                       min_value=1, max_value=60, value=int(d["D_c"]), step=1)
-        v["calendar_days"] = num("calendar_days", "Calendar days covered by this cycle",
-                                 "Household expense/income period, including idle days. Separate from working shifts.",
-                                 min_value=0.01, max_value=3650.0, value=float(d["calendar_days"]), step=0.25)
-        v["h"] = num("h", "Hours per worker per shift", None, min_value=0.5, max_value=24.0,
-                     value=float(d["h"]), step=0.25, format="%.2f")
+        if v["timing_mode"] == "batch":
+            st.caption("Working days: discretized Beta-PERT, rounded to the nearest whole day. Idle days: continuous Beta-PERT.")
+            for prefix, title in (("work", "Active working days"), ("idle", "Idle days")):
+                for suffix in ("min", "mode", "max"):
+                    key = f"{prefix}_{suffix}"
+                    if prefix == "work":
+                        v[key] = num(key, f"{title}: {suffix}", min_value=1, max_value=3650, value=int(d[key]), step=1)
+                    else:
+                        v[key] = num(key, f"{title}: {suffix}", min_value=0., max_value=3650., value=float(d[key]), step=.25)
+            st.caption("Out of ten working days, how many had 1, 2, or 3 shifts? Counts must total ten.")
+            for count in (1, 2, 3):
+                key = f"days_{count}"
+                v[key] = num(key, f"Days with {count} shift(s)", min_value=0, max_value=10, value=int(d[key]), step=1)
+                for suffix in ("min", "mode", "max"):
+                    key = f"h{count}_{suffix}"
+                    v[key] = num(key, f"Hours per shift on {count}-shift days: {suffix}",
+                                 min_value=.5, max_value=min(16., 24. / count), value=float(d[key]), step=.25)
+        else:
+            v["D_c"] = num("D_c", "Fixed shifts per cycle", min_value=1, max_value=3650, value=int(d["D_c"]), step=1)
+            v["calendar_days"] = num("calendar_days", "Fixed calendar days", min_value=.01, max_value=3650.,
+                                     value=float(d["calendar_days"]), step=.25)
+            v["h"] = num("h", "Fixed hours per worker per shift", min_value=.5, max_value=24., value=float(d["h"]), step=.25)
 
         st.markdown("**2. Stakeholder accounting**")
         v["s_m"] = num("s_m", "Miner-group revenue share s_m", "Group share of the revenue base (1 minus the non-miner share).",
-                       min_value=0.01, max_value=1.0, value=float(d["s_m"]), step=0.01, format="%.4f")
+                       min_value=0.01, max_value=1.0, value=float(d["s_m"]), step=0.01, format="%.4f", disabled=v["share_preset"] != "Custom")
         v["tribute_base"] = rad("tribute_base", "Share applies to", ["gross", "net"],
                                 "gross: miners pay their cost share out of their revenue share. "
                                 "net: costs are deducted first, then the share is applied.")
 
-        st.markdown("**3. Gold yield** (group total, grams of dore per cycle)")
-        v["ya"] = num("ya", "Typical minimum yield a (g)", "Pilot mean of respondents' typical minimum (provisional).",
+        st.markdown("**3. Gold yield** (group total, recovered grams per batch)")
+        v["ya"] = num("ya", "Typical minimum yield a (g)", "Minimum ordinary batch yield.",
                       min_value=0.0, max_value=1000.0, value=float(d["ya"]), step=0.05, format="%.3f")
-        v["yb"] = num("yb", "Typical maximum yield b (g)", "Pilot mean of respondents' typical maximum (provisional).",
+        v["yb"] = num("yb", "Typical maximum yield b (g)", "Maximum ordinary batch yield.",
                       min_value=0.0, max_value=1000.0, value=float(d["yb"]), step=0.05, format="%.3f")
-        v["mode_pct"] = sld("mode_pct", "Most-likely yield (mode) as % of the a-to-b range",
-                            "No 'usual' value was collected, so the mode is an assumption.",
-                            min_value=0.0, max_value=100.0, value=float(d["mode_pct"]), step=1.0)
+        v["ym"] = num("ym", "Most likely ordinary batch yield (g)",
+                      min_value=0., max_value=1000., value=float(d["ym"]), step=.05, format="%.3f")
         v["p0_mode"] = rad("p0_mode", "Zero-yield probability from", ["fixed value", "from counts"],
-                           "counts: p0 ~ Beta(1+z, 1+n-z), drawn for every simulated cycle.")
-        v["p0"] = sld("p0", "Zero-yield (waste cycle) probability p0", "Assumed: zero-yield counts were not collected.",
+                           "counts: p0 ~ Beta(1+z, 1+n-z), drawn for every simulated batch.")
+        v["p0"] = sld("p0", "Zero-yield (waste cycle) probability p0", "Probability that a completed batch has no recovered gold.",
                       min_value=0.0, max_value=1.0, value=float(d["p0"]), step=0.01)
-        v["z"] = num("z", "Zero-yield cycles observed z", None, min_value=0, max_value=1000, value=int(d["z"]), step=1)
-        v["n_obs"] = num("n_obs", "Cycles recorded n", None, min_value=0, max_value=1000, value=int(d["n_obs"]), step=1)
-        v["pi_J"] = num("pi_J", "Jackpot probability pi_J (given a productive cycle)", "Assumed. Set 0 for no jackpot component.",
+        v["z"] = num("z", "Zero-yield completed batches z", None, min_value=0, max_value=1000, value=int(d["z"]), step=1)
+        v["n_obs"] = num("n_obs", "Completed batches recorded n", None, min_value=0, max_value=1000, value=int(d["n_obs"]), step=1)
+        v["pi_J"] = num("pi_J", "Jackpot probability pi_J (given a productive batch)", "Assumed. Set 0 for no jackpot component.",
                         min_value=0.0, max_value=1.0, value=float(d["pi_J"]), step=0.005, format="%.4f")
-        v["jack_thr"] = num("jack_thr", "Jackpot threshold (g)", "Lowest reported jackpot (3 respondents).",
+        v["jack_thr"] = num("jack_thr", "Jackpot threshold (g)", "Lower bound of the truncated-Pareto batch jackpot.",
                             min_value=0.1, max_value=1000.0, value=float(d["jack_thr"]), step=0.5, format="%.2f")
-        v["jack_cap"] = num("jack_cap", "Jackpot cap (g)", "Highest reported jackpot / physical capacity.",
+        v["jack_cap"] = num("jack_cap", "Jackpot cap (g)", "Physical upper bound for one batch.",
                             min_value=0.1, max_value=1000.0, value=float(d["jack_cap"]), step=0.5, format="%.2f")
         v["jack_shape"] = num("jack_shape", "Jackpot tail shape (Pareto)", "Assumed; smaller = heavier tail.",
                               min_value=0.2, max_value=5.0, value=float(d["jack_shape"]), step=0.1, format="%.2f")
 
         st.markdown("**4. Price and purity** (handled exactly once)")
-        v["price_basis"] = rad("price_basis", "Price basis", ["farmgate", "reference"],
-                               "farmgate: realized price already reflects grade, so purity is NOT applied. "
-                               "reference: pure-gold price, purity applied.")
+        st.caption("Farmgate pricing values recovered gold directly. Reference pricing applies purity to obtain fine gold mass.")
         v["p_min"] = num("p_min", "Price minimum (PHP/g)", None, min_value=1.0, max_value=1_000_000.0,
                          value=float(d["p_min"]), step=50.0, format="%.2f")
-        v["p_mode"] = num("p_mode", "Price most likely (PHP/g)", "Pilot: the most frequently reported price.",
+        v["p_mode"] = num("p_mode", "Price most likely (PHP/g)", "Most likely price under this scenario.",
                           min_value=1.0, max_value=1_000_000.0, value=float(d["p_mode"]), step=50.0, format="%.2f")
         v["p_max"] = num("p_max", "Price maximum (PHP/g)", None, min_value=1.0, max_value=1_000_000.0,
                          value=float(d["p_max"]), step=50.0, format="%.2f")
         v["q_min"] = num("q_min", "Purity minimum q (used only on a reference basis)", None, min_value=0.01,
-                         max_value=1.0, value=float(d["q_min"]), step=0.01, format="%.3f")
+                         max_value=1.0, value=float(d["q_min"]), step=0.01, format="%.3f", disabled=v["price_basis"] == "farmgate")
         v["q_mode"] = num("q_mode", "Purity most likely q", None, min_value=0.01, max_value=1.0,
-                          value=float(d["q_mode"]), step=0.01, format="%.3f")
+                          value=float(d["q_mode"]), step=0.01, format="%.3f", disabled=v["price_basis"] == "farmgate")
         v["q_max"] = num("q_max", "Purity maximum q", None, min_value=0.01, max_value=1.0,
-                         value=float(d["q_max"]), step=0.01, format="%.3f")
+                         value=float(d["q_max"]), step=0.01, format="%.3f", disabled=v["price_basis"] == "farmgate")
 
-        st.markdown("**5. Operating costs** (PHP per cycle, group level)")
-        v["fixed_cost"] = num("fixed_cost", "Fixed operating cost", "Assumed: costs were not collected in the pilot.",
-                              min_value=0.0, max_value=10_000_000.0, value=float(d["fixed_cost"]), step=10.0, format="%.2f")
-        v["fixed_share"] = num("fixed_share", "Share paid by miners (fixed cost)", "1 = miners pay, 0 = financier pays.",
-                               min_value=0.0, max_value=1.0, value=float(d["fixed_share"]), step=0.05, format="%.2f")
-        v["fuel_min"] = num("fuel_min", "Fuel minimum", None, min_value=0.0, max_value=10_000_000.0,
-                            value=float(d["fuel_min"]), step=10.0, format="%.2f")
-        v["fuel_mode"] = num("fuel_mode", "Fuel most likely", None, min_value=0.0, max_value=10_000_000.0,
-                             value=float(d["fuel_mode"]), step=10.0, format="%.2f")
-        v["fuel_max"] = num("fuel_max", "Fuel maximum", None, min_value=0.0, max_value=10_000_000.0,
-                            value=float(d["fuel_max"]), step=10.0, format="%.2f")
-        v["fuel_share"] = num("fuel_share", "Share paid by miners (fuel)", None, min_value=0.0, max_value=1.0,
-                              value=float(d["fuel_share"]), step=0.05, format="%.2f")
-        v["trans_min"] = num("trans_min", "Transport/hauling minimum", None, min_value=0.0, max_value=10_000_000.0,
-                             value=float(d["trans_min"]), step=10.0, format="%.2f")
-        v["trans_mode"] = num("trans_mode", "Transport/hauling most likely", None, min_value=0.0,
-                              max_value=10_000_000.0, value=float(d["trans_mode"]), step=10.0, format="%.2f")
-        v["trans_max"] = num("trans_max", "Transport/hauling maximum", None, min_value=0.0, max_value=10_000_000.0,
-                             value=float(d["trans_max"]), step=10.0, format="%.2f")
-        v["trans_share"] = num("trans_share", "Share paid by miners (transport)", None, min_value=0.0, max_value=1.0,
-                               value=float(d["trans_share"]), step=0.05, format="%.2f")
-        v["dependence"] = rad("dependence", "Cost dependence", ["copula", "independent"],
-                              "copula: fuel and transport costs move together (Gaussian copula on a Spearman correlation).")
-        v["rho"] = num("rho", "Spearman correlation fuel-transport", "Assumed; no data on dependence.",
-                       min_value=-0.95, max_value=0.95, value=float(d["rho"]), step=0.05, format="%.2f")
+        st.markdown("**5. Expense rates for the whole operation**")
+        st.caption("Food is additional worksite consumption excluded from household needs. Operating hours sum scheduled shift durations, without multiplying by crew size.")
+        v["fixed_cost"] = num("fixed_cost", "Additional fixed overhead (PHP/batch)", min_value=0.,
+                              max_value=10_000_000., value=float(d["fixed_cost"]), step=10.)
+        v["fixed_share"] = num("fixed_share", "Miner fraction of overhead", min_value=0., max_value=1.,
+                               value=float(d["fixed_share"]), step=.5)
+        for prefix, name in DL.COST_FIELDS.items():
+            key = f"{prefix}_basis"
+            options = list(E2.COST_BASES)
+            v[key] = rad(key, f"{name.title()} expense basis", options)
+            if v["timing_mode"] == "fixed" and v[key] == "per_working_day":
+                st.warning(f"{name.title()}: fixed timing has no working-day count. Choose a per-batch, "
+                           "per-shift, operating-hour, or calendar-day basis and enter its corresponding "
+                           "rates before running. The current daily rate is not converted automatically.")
+            for suffix in ("min", "mode", "max"):
+                key = f"{prefix}_{suffix}"
+                v[key] = num(key, f"{name.title()} rate: {suffix}", "Units follow the selected expense basis; whole operation.",
+                             min_value=0., max_value=10_000_000., value=float(d[key]), step=10.)
+            key = f"{prefix}_share"
+            v[key] = num(key, f"Miner fraction of {name}", "0 = financier, 0.5 = split, 1 = miners.",
+                         min_value=0., max_value=1., value=float(d[key]), step=.5)
+        v["dependence"] = rad("dependence", "Expense-rate dependence", ["copula", "independent"])
+        st.caption("Spearman targets apply to rates before exposure scaling. The diagonal is one; entries below define both symmetric cells.")
+        for i, j, key in DL.correlation_keys():
+            names = list(DL.COST_FIELDS.values())
+            v[key] = num(key, f"Rate correlation: {names[i]} / {names[j]}",
+                         min_value=-.95, max_value=.95, value=float(d[key]), step=.05)
 
         st.markdown("**6. Equipment** (purchased OR rented, never blended)")
         v["eq_mode"] = rad("eq_mode", "Main equipment", ["none", "purchased", "rented"])
@@ -153,7 +177,7 @@ def v2_form(preset: str) -> tuple:
         v["eq_share"] = num("eq_share", "Share paid by miners (equipment)", None, min_value=0.0, max_value=1.0,
                             value=float(d["eq_share"]), step=0.05, format="%.2f")
 
-        st.markdown("**Replacement reserve** (per cycle)")
+        st.markdown("**Reserve fund** (per batch: replacement or custom emergency target)")
         v["reserve_mode"] = rad("reserve_mode", "Reserve target", ["none", "match_depreciation", "custom"],
                                 "None is the default. Matching depreciation is a savings target, not another economic expense.")
         v["reserve_location"] = rad("reserve_location", "Reserve funded from",
@@ -170,12 +194,13 @@ def v2_form(preset: str) -> tuple:
                          min_value=0.01, max_value=5000.0, value=float(d["W_opp"]), step=1.0, format="%.2f")
         v["W_src"] = st.text_input("Wage benchmark source", value=str(d["W_src"]), key=f"{ps}__W_src")
         v["W_date"] = st.text_input("Wage benchmark effective date", value=str(d["W_date"]), key=f"{ps}__W_date")
-        v["hh_need"] = num("hh_need", "Household essential spending (PHP/household/day)", "Pilot mean; household layer only.",
+        v["hh_need"] = num("hh_need", "Household consumption W_daily (PHP/household/calendar day)", "Excludes additional worksite food. Batch mode represents one household per worker.",
                            min_value=0.0, max_value=1_000_000.0, value=float(d["hh_need"]), step=25.0, format="%.2f")
-        v["n_hh"] = num("n_hh", "Households supported (0 = one per crew member)", None, min_value=0, max_value=200,
-                        value=int(d["n_hh"]), step=1)
-        v["nonmining"] = num("nonmining", "Non-mining income (PHP/household/day)", None, min_value=0.0,
-                             max_value=1_000_000.0, value=float(d["nonmining"]), step=25.0, format="%.2f")
+        if v["timing_mode"] == "fixed":
+            v["n_hh"] = num("n_hh", "Households supported (0 = one per crew member)", None, min_value=0, max_value=200,
+                            value=int(d["n_hh"]), step=1)
+            v["nonmining"] = num("nonmining", "Non-mining income (PHP/household/day)", None, min_value=0.0,
+                                 max_value=1_000_000.0, value=float(d["nonmining"]), step=25.0, format="%.2f")
 
         st.markdown("**8. Simulation precision**")
         v["seed"] = st.number_input("Random seed", key=f"{ps}__seed", help="Same seed + same inputs = same results.",
@@ -203,7 +228,7 @@ def render_v2(state: dict) -> None:
          "How to read this"])
 
     with tab_over:
-        st.info("Scenario results under the inputs in the sidebar. They are not findings about Pantukan miners.")
+        st.info("Scenario results under the stated inputs. Presets are synthetic demonstrations.")
         st.markdown(f"**{len(assumed)}** inputs are 🟠 assumed and **{len(user)}** were 🟣 changed by you.")
         with st.expander("Which inputs are assumptions?"):
             st.write(", ".join(assumed) if assumed else "None.")
@@ -219,8 +244,9 @@ def render_v2(state: dict) -> None:
                     st.metric(E2.LABELS[key], f"{s[key]:.1%}")
                     st.caption(f"± {2 * s['MCSE_' + key]:.2%} (2 MCSE)")
         st.markdown(DL.risk_band_text(res))
-        st.caption(f"N = {s['N']:,} simulated cycles - convergence {'reached' if s['converged'] else 'NOT reached'} - "
-                   f"calendar days = {s['calendar_days_per_cycle']:g} - person-hours per cycle L = {s['L_person_hours']:.1f} - household requirement B_HH = {s['B_HH']:,.0f} PHP")
+        st.caption(f"N = {s['N']:,} simulated batches - convergence {'reached' if s['converged'] else 'NOT reached'}")
+        st.subheader("Timing and household requirements")
+        st.dataframe(DL.timing_table(res))
 
         left, right = st.columns(2)
         with left:
@@ -302,6 +328,7 @@ def render_v2(state: dict) -> None:
 # Legacy V1.0
 # ------------------------------------------------------------------------------------------------
 def legacy_form() -> tuple:
+    """Draw the sidebar form for the legacy V1.0 per-person inputs. Returns (values dict, submitted flag)."""
     d = DL.LEGACY_DEFAULTS
     v = {}
     with st.sidebar.form(key="form_legacy"):
@@ -340,6 +367,7 @@ def legacy_form() -> tuple:
 
 
 def render_legacy(v: dict, out: dict) -> None:
+    """Render the legacy V1.0 results (deterministic reference, simulation, and known flaws)."""
     st.warning("Legacy V1.0, shown for comparison only. It has known flaws (listed below) and its outputs should not be "
                "reported as results.")
     c1, c2 = st.columns(2)
@@ -360,6 +388,7 @@ def render_legacy(v: dict, out: dict) -> None:
 
 # ------------------------------------------------------------------------------------------------
 def main() -> None:
+    """Streamlit app entry point: render the sidebar, dispatch to V2.2 or legacy V1.0, and show results."""
     st.set_page_config(page_title="Project AURUM", layout="wide")
     st.title("Project AURUM: Decision-Support Model")
     st.markdown("### Zero-aware stochastic risk analysis for small-scale gold mining")
@@ -386,7 +415,7 @@ def main() -> None:
         return
 
     preset = st.sidebar.selectbox("Scenario preset", DL.PRESETS, index=0, key="preset")
-    st.sidebar.caption("🟢 pilot  🟠 assumed  🔵 external  ⚪ synthetic  🟣 changed by you")
+    st.sidebar.caption("🟠 assumed  🔵 external  ⚪ synthetic  🟣 changed by you")
     values, submitted = v2_form(preset)
 
     if submitted:

@@ -4,11 +4,11 @@ dashboard_logic.py -- everything the dashboard does EXCEPT drawing widgets.
 Kept free of Streamlit so it can be unit-tested offline. app.py is a thin layer on top.
 
 Design rules taken from the expert report:
-  * every input carries a provenance tag (pilot / assumed / external / synthetic / user-entered)
+  * every input carries a provenance tag (assumed / external / synthetic / user-entered)
   * three thresholds (break-even, opportunity-wage, household) are reported separately
   * risk outputs use the recommended labels, with MCSE, quantiles and expected shortfall
   * no "poverty trap" wording and no directive advice (no "exit" / "greenlight" messages)
-  * observed pilot data, simulated results, assumptions and normative thresholds are kept visibly apart
+  * synthetic demonstrations and externally sourced inputs are labeled explicitly
 """
 from __future__ import annotations
 
@@ -26,96 +26,105 @@ from scipy import stats  # noqa: E402
 
 import engine_v2 as E2  # noqa: E402
 import legacy_v1  # noqa: E402
-from scenarios import synthetic_profiles  # noqa: E402
+from scenarios import synthetic_profiles, default_timing, legacy_synthetic_values  # noqa: E402
 
-DASHBOARD_VERSION = "2.1.0-draft"
+DASHBOARD_VERSION = "2.2.0-draft"
 
 # --------------------------------------------------------------------------------------
 # Provenance tags
 # --------------------------------------------------------------------------------------
-TAG_LABEL = {"pilot": "🟢 pilot", "assumed": "🟠 assumed", "external": "🔵 external",
+TAG_LABEL = {"assumed": "🟠 assumed", "external": "🔵 external",
              "synthetic": "⚪ synthetic", "user": "🟣 user-entered"}
-TAG_HELP = {
-    "pilot": "From the 21-interview pilot (non-representative convenience sample; averages of respondents' answers).",
-    "assumed": "NOT collected in the pilot. A placeholder that must be replaced or sensitivity-tested.",
-    "external": "From a cited outside source.",
-    "synthetic": "Invented for verification only.",
-    "user": "You changed this from the preset value. Its source is not verified.",
-}
+TAG_HELP = {"assumed": "A stated assumption to sensitivity-test.",
+            "external": "From a cited outside source.", "synthetic": "Invented for demonstration only.",
+            "user": "User-entered; its source is not verified."}
+PRESETS = ["Synthetic: Baseline", "Synthetic: High-Cost", "Synthetic: Low-Purity"]
+_PRESET_TO_PROFILE = dict(zip(PRESETS, ("Baseline", "High-Cost", "Low-Purity")))
+COST_FIELDS = {"fuel": "fuel", "milling": "milling", "explosives": "explosives",
+               "trans": "transport", "food": "food"}
+BASIS_LABELS = {"per_batch": "PHP/batch", "per_shift": "PHP/shift",
+                "per_operating_hour": "PHP/operating hour", "per_working_day": "PHP/working day",
+                "per_calendar_day": "PHP/calendar day"}
 
-PRESETS = ["Pilot-provisional baseline", "Synthetic: High-Cost", "Synthetic: Low-Purity"]
-_PRESET_TO_PROFILE = {PRESETS[0]: "Baseline", PRESETS[1]: "High-Cost", PRESETS[2]: "Low-Purity"}
 
-_BASE_TAGS = {
-    "calendar_days": "assumed", "reserve_mode": "assumed", "reserve_location": "assumed",
-    "reserve_priority": "assumed", "reserve_custom": "assumed",
-    "n_c": "assumed", "D_c": "pilot", "h": "pilot", "s_m": "pilot", "tribute_base": "assumed",
-    "ya": "pilot", "yb": "pilot", "mode_pct": "assumed",
-    "p0_mode": "assumed", "p0": "assumed", "z": "assumed", "n_obs": "assumed",
-    "pi_J": "assumed", "jack_thr": "pilot", "jack_cap": "pilot", "jack_shape": "assumed",
-    "price_basis": "assumed", "p_min": "pilot", "p_mode": "pilot", "p_max": "pilot",
-    "q_min": "assumed", "q_mode": "assumed", "q_max": "assumed",
-    "fixed_cost": "assumed", "fixed_share": "assumed",
-    "fuel_min": "assumed", "fuel_mode": "assumed", "fuel_max": "assumed", "fuel_share": "assumed",
-    "trans_min": "assumed", "trans_mode": "assumed", "trans_max": "assumed", "trans_share": "assumed",
-    "rho": "assumed", "dependence": "assumed",
-    "eq_mode": "assumed", "eq_acq": "assumed", "eq_salv": "assumed", "eq_life": "assumed",
-    "eq_util": "assumed", "eq_rent": "assumed", "eq_share": "assumed",
-    "W_opp": "pilot", "hh_need": "pilot", "n_hh": "assumed", "nonmining": "assumed",
-}
-_COST_KEYS = ["fixed_cost", "fixed_share", "fuel_min", "fuel_mode", "fuel_max", "fuel_share",
-              "trans_min", "trans_mode", "trans_max", "trans_share"]
+def correlation_keys():
+    """List (i, j, widget key) triples for every pairwise cost-rate correlation above the diagonal."""
+    names = list(COST_FIELDS)
+    return [(i, j, f"rho_{names[i]}_{names[j]}") for i in range(len(names)) for j in range(i + 1, len(names))]
 
 
 def param_tags(preset: str) -> Dict[str, str]:
-    tags = dict(_BASE_TAGS)
-    if preset == PRESETS[1]:
-        tags.update({k: "synthetic" for k in _COST_KEYS if not k.endswith("share")})
-    if preset == PRESETS[2]:
-        tags.update({k: "synthetic" for k in ("price_basis", "p_min", "p_mode", "p_max", "q_min", "q_mode", "q_max")})
-    return tags
+    """Default provenance tag ('synthetic') for every preset parameter except run-control fields."""
+    return {k: "synthetic" for k in preset_values(preset)
+            if k not in ("seed", "tol", "n_max", "W_src", "W_date")}
 
 
-# --------------------------------------------------------------------------------------
-# Inputs <-> flat UI values
-# --------------------------------------------------------------------------------------
 def values_from_inputs(inp: E2.Inputs) -> Dict[str, object]:
-    """Convert engine Inputs back into the flat UI values dict used by the form."""
-    cost = {c.name: c for c in inp.costs}
-    fx, fu, tr = cost["fixed_operating"], cost["fuel"], cost["transport_hauling"]
-    y = inp.yield_ord
-    j = inp.jackpot or E2.Jackpot(14.4, 24.0, 1.5)
+    """Map supported dashboard expense categories and one equipment item to widgets."""
+    y, j = inp.yield_ord, inp.jackpot or E2.Jackpot(30, 60, 1.5)
     price = inp.price if isinstance(inp.price, E2.PERT) else E2.PERT(inp.price, inp.price, inp.price)
     pur = inp.purity if isinstance(inp.purity, E2.PERT) else E2.PERT(inp.purity, inp.purity, inp.purity)
     if inp.price_basis == "farmgate":
-        pur = E2.PERT(0.80, 0.88, 0.93)               # unused on a farmgate basis; shown as a starting point
-    rho = inp.rho_spearman[0][1] if inp.rho_spearman else 0.5
-    return {
-        "calendar_days": inp.calendar_days(), "reserve_mode": inp.reserve_mode,
-        "reserve_location": inp.reserve_location or "choose", "reserve_priority": inp.reserve_priority or "choose",
-        "reserve_custom": inp.reserve_custom_per_cycle,
-        "n_c": int(inp.n_c), "D_c": int(inp.D_c), "h": float(inp.hours_per_worker_shift),
-        "s_m": float(inp.s_m), "tribute_base": inp.tribute_base,
+        pur = E2.PERT(.75, .85, .95)
+    v = {
+        "timing_mode": "batch" if inp.batch_timing else "fixed",
+        "calendar_days": 1. if inp.batch_timing else inp.calendar_days(),
+        "n_c": inp.n_c, "D_c": inp.D_c, "h": float(inp.hours_per_worker_shift),
+        "s_m": float(inp.s_m), "share_preset": "Custom", "tribute_base": inp.tribute_base,
         "ya": float(y.a), "yb": float(y.b),
-        "mode_pct": float(100.0 * (y.m - y.a) / (y.b - y.a)) if y.b > y.a else 50.0,
-        "p0_mode": "fixed value", "p0": float(inp.zero.p0 if inp.zero.p0 is not None else 0.1), "z": 0, "n_obs": 10,
-        "pi_J": float(inp.pi_J), "jack_thr": float(j.threshold), "jack_cap": float(j.cap), "jack_shape": float(j.shape),
-        "price_basis": inp.price_basis,
-        "p_min": float(price.a), "p_mode": float(price.m), "p_max": float(price.b),
+        "ym": float(y.m),
+        "p0_mode": "fixed value" if inp.zero.p0 is not None else "from counts",
+        "p0": float(inp.zero.p0 if inp.zero.p0 is not None else .1),
+        "z": inp.zero.z if inp.zero.z is not None else 0,
+        "n_obs": inp.zero.n if inp.zero.n is not None else 10,
+        "pi_J": inp.pi_J, "jack_thr": float(j.threshold), "jack_cap": float(j.cap), "jack_shape": float(j.shape),
+        "price_basis": inp.price_basis, "p_min": float(price.a), "p_mode": float(price.m), "p_max": float(price.b),
         "q_min": float(pur.a), "q_mode": float(pur.m), "q_max": float(pur.b),
-        "fixed_cost": float(fx.fixed), "fixed_share": float(fx.miner_share),
-        "fuel_min": float(fu.pert.a), "fuel_mode": float(fu.pert.m), "fuel_max": float(fu.pert.b),
-        "fuel_share": float(fu.miner_share),
-        "trans_min": float(tr.pert.a), "trans_mode": float(tr.pert.m), "trans_max": float(tr.pert.b),
-        "trans_share": float(tr.miner_share),
-        "rho": float(rho), "dependence": inp.dependence,
-        "eq_mode": "none", "eq_acq": 0.0, "eq_salv": 0.0, "eq_life": 1000.0, "eq_util": 1.0, "eq_rent": 0.0,
-        "eq_share": 1.0,
-        "W_opp": float(inp.W_opp), "W_src": inp.W_opp_source, "W_date": inp.W_opp_date,
-        "hh_need": float(inp.hh_need_per_household_day), "n_hh": 0 if inp.n_households is None else int(inp.n_households),
-        "nonmining": float(inp.nonmining_income_per_household_day),
-        "seed": 42, "tol": 0.005, "n_max": 200_000,
+        "fixed_cost": 0., "fixed_share": 1., "dependence": inp.dependence,
+        "reserve_mode": inp.reserve_mode, "reserve_location": inp.reserve_location or "choose",
+        "reserve_priority": inp.reserve_priority or "choose", "reserve_custom": inp.reserve_custom_per_cycle,
+        "eq_mode": "none", "eq_acq": 0., "eq_salv": 0., "eq_life": 1000., "eq_util": 1., "eq_rent": 0., "eq_share": 1.,
+        "W_opp": inp.W_opp, "W_src": inp.W_opp_source, "W_date": inp.W_opp_date,
+        "hh_need": inp.hh_need_per_household_day, "n_hh": inp.n_households or 0,
+        "nonmining": inp.nonmining_income_per_household_day, "seed": 42, "tol": .005, "n_max": 200_000,
     }
+    t = inp.batch_timing or default_timing()
+    for prefix, pert in (("work", t.work_days), ("idle", t.idle_days)):
+        for suffix, value in zip(("min", "mode", "max"), (pert.a, pert.m, pert.b)):
+            v[f"{prefix}_{suffix}"] = int(value) if prefix == "work" else float(value)
+    for d in (1, 2, 3):
+        v[f"days_{d}"] = t.shift_counts[d - 1]
+        for suffix, value in zip(("min", "mode", "max"), pert_values(t.hours_by_shifts[d])):
+            v[f"h{d}_{suffix}"] = float(value)
+    costs = {c.name: c for c in inp.costs}
+    resolved_names = {}
+    for prefix, name in COST_FIELDS.items():
+        c = costs.get(name) or (costs.get("transport_hauling") if prefix == "trans" else None)
+        c = c or E2.CostItem(name, fixed=0.)
+        resolved_names[name] = c.name
+        pert = c.pert or E2.PERT(c.fixed, c.fixed, c.fixed)
+        for suffix, value in zip(("min", "mode", "max"), pert_values(pert)):
+            v[f"{prefix}_{suffix}"] = float(value)
+        v[f"{prefix}_share"], v[f"{prefix}_basis"] = float(c.miner_share), c.basis
+    if "fixed_operating" in costs:
+        c = costs["fixed_operating"]
+        v.update(fixed_cost=float(c.fixed), fixed_share=float(c.miner_share))
+    stochastic_names = [c.name for c in inp.stochastic_cost_items()]
+    for i, j, key in correlation_keys():
+        names = list(COST_FIELDS.values())
+        left, right = resolved_names[names[i]], resolved_names[names[j]]
+        v[key] = (float(inp.rho_spearman[stochastic_names.index(left)][stochastic_names.index(right)])
+                  if inp.rho_spearman is not None and left in stochastic_names and right in stochastic_names else 0.)
+    if inp.equipment:
+        eq = inp.equipment[0]
+        v.update(eq_mode=eq.mode, eq_acq=eq.acquisition, eq_salv=eq.salvage, eq_life=eq.life_cycles,
+                 eq_util=eq.utilization, eq_rent=eq.rental_rate_per_shift, eq_share=eq.miner_share)
+    return v
+
+
+def pert_values(pert):
+    """Return a PERT's (min, mode, max) tuple."""
+    return pert.a, pert.m, pert.b
 
 
 @functools.lru_cache(maxsize=None)
@@ -137,82 +146,91 @@ def tag_for(name: str, value, preset: str) -> str:
 
 
 def effective_tags(values: Dict[str, object], preset: str) -> Dict[str, str]:
-    return {k: tag_for(k, values[k], preset) for k in param_tags(preset) if k in values}
+    """Provenance tags for the current form `values`, resolving the share preset first."""
+    effective = dict(values)
+    if values.get("share_preset") in ("50/50", "60/40", "65/35"):
+        effective["s_m"] = {"50/50": .5, "60/40": .6, "65/35": .65}[values["share_preset"]]
+    return {k: tag_for(k, effective[k], preset) for k in param_tags(preset) if k in effective}
 
 
 def build_inputs(v: Dict[str, object], preset: Optional[str] = None) -> E2.Inputs:
     """Flat UI values -> engine Inputs (validation happens in engine_v2.validate / run)."""
-    # Validate raw numeric values before conversion; int()/float() must not hide bad input.
-    numeric = ["h", "s_m", "ya", "yb", "mode_pct", "pi_J", "p_min", "p_mode", "p_max",
-               "fixed_cost", "fixed_share", "fuel_min", "fuel_mode", "fuel_max", "fuel_share",
-               "trans_min", "trans_mode", "trans_max", "trans_share", "W_opp", "hh_need", "nonmining"]
-    if "calendar_days" in v:
-        numeric.append("calendar_days")
+    numeric = ["s_m", "ya", "yb", "ym", "pi_J", "p_min", "p_mode", "p_max",
+               "fixed_cost", "fixed_share", "W_opp", "hh_need"]
+    integers = [("n_c", 1)]
+    batch = v["timing_mode"] == "batch"
+    if v["timing_mode"] not in ("batch", "fixed"):
+        raise E2.InputError("Choose batch or fixed timing.")
+    if batch:
+        integers += [(f"work_{s}", 1) for s in ("min", "mode", "max")]
+        integers += [(f"days_{d}", 0) for d in (1, 2, 3)]
+        numeric += [f"idle_{s}" for s in ("min", "mode", "max")]
+        numeric += [f"h{d}_{s}" for d in (1, 2, 3) for s in ("min", "mode", "max")]
+    else:
+        integers += [("D_c", 1), ("n_hh", 0)]
+        numeric += ["h", "calendar_days", "nonmining"]
+    for prefix in COST_FIELDS:
+        numeric += [f"{prefix}_{s}" for s in ("min", "mode", "max", "share")]
     if v["p0_mode"] == "fixed value":
         numeric.append("p0")
+    elif v["p0_mode"] == "from counts":
+        integers += [("z", 0), ("n_obs", 0)]
+    else:
+        raise E2.InputError("Choose a fixed zero probability or counts.")
     if E2.finite_number(v["pi_J"]) and v["pi_J"] > 0:
-        numeric.extend(["jack_thr", "jack_cap", "jack_shape"])
+        numeric += ["jack_thr", "jack_cap", "jack_shape"]
     if v["price_basis"] == "reference":
-        numeric.extend(["q_min", "q_mode", "q_max"])
+        numeric += ["q_min", "q_mode", "q_max"]
     if v["dependence"] == "copula":
-        numeric.append("rho")
+        numeric += [key for _, _, key in correlation_keys()]
     if v["eq_mode"] == "purchased":
-        numeric.extend(["eq_acq", "eq_salv", "eq_life", "eq_util", "eq_share"])
+        numeric += ["eq_acq", "eq_salv", "eq_life", "eq_util", "eq_share"]
     elif v["eq_mode"] == "rented":
-        numeric.extend(["eq_rent", "eq_share"])
+        numeric += ["eq_rent", "eq_share"]
     if v.get("reserve_mode") == "custom":
         numeric.append("reserve_custom")
     errs = []
     for name in numeric:
         E2.require_finite(name, v[name], errs)
-    for name, minimum in (("n_c", 1), ("D_c", 1), ("n_hh", 0)):
+    for name, minimum in integers:
         E2.require_integer(name, v[name], minimum, errs)
-    if v["p0_mode"] == "from counts":
-        for name in ("z", "n_obs"):
-            E2.require_integer(name, v[name], 0, errs)
     if errs:
         raise E2.InputError("\n".join(errs))
-    pert = E2.PERT
-    zero = (E2.ZeroYield(p0=float(v["p0"])) if v["p0_mode"] == "fixed value"
-            else E2.ZeroYield(z=v["z"], n=v["n_obs"]))
-    a, b = float(v["ya"]), float(v["yb"])
-    y = pert(a, a + float(v["mode_pct"]) / 100.0 * (b - a), b)
-    jack = (E2.Jackpot(float(v["jack_thr"]), float(v["jack_cap"]), float(v["jack_shape"]))
-            if float(v["pi_J"]) > 0 else None)
-    costs = [
-        E2.CostItem("fixed_operating", float(v["fixed_share"]), fixed=float(v["fixed_cost"])),
-        E2.CostItem("fuel", float(v["fuel_share"]), pert=pert(float(v["fuel_min"]), float(v["fuel_mode"]), float(v["fuel_max"]))),
-        E2.CostItem("transport_hauling", float(v["trans_share"]),
-                    pert=pert(float(v["trans_min"]), float(v["trans_mode"]), float(v["trans_max"]))),
-    ]
-    equipment: List[E2.EquipmentItem] = []
+    def pert(prefix):
+        """Build a PERT from the `{prefix}_min/mode/max` widget values."""
+        return E2.PERT(*(v[f"{prefix}_{s}"] for s in ("min", "mode", "max")))
+    timing = (E2.BatchTiming(pert("work"), pert("idle"), tuple(v[f"days_{d}"] for d in (1, 2, 3)),
+                            {d: pert(f"h{d}") for d in (1, 2, 3)}) if batch else None)
+    zero = E2.ZeroYield(p0=v["p0"]) if v["p0_mode"] == "fixed value" else E2.ZeroYield(z=v["z"], n=v["n_obs"])
+    y = E2.PERT(v["ya"], v["ym"], v["yb"])
+    jack = E2.Jackpot(v["jack_thr"], v["jack_cap"], v["jack_shape"]) if v["pi_J"] > 0 else None
+    costs = [E2.CostItem("fixed_operating", v["fixed_share"], fixed=v["fixed_cost"])]
+    costs += [E2.CostItem(name, v[f"{prefix}_share"], pert=pert(prefix), basis=v[f"{prefix}_basis"])
+              for prefix, name in COST_FIELDS.items()]
+    rho = np.eye(len(COST_FIELDS))
+    if v["dependence"] == "copula":
+        for i, j, key in correlation_keys():
+            rho[i, j] = rho[j, i] = v[key]
+    equipment = []
     if v["eq_mode"] != "none":
-        equipment.append(E2.EquipmentItem(
-            "main_equipment", str(v["eq_mode"]), miner_share=float(v["eq_share"]),
-            acquisition=float(v["eq_acq"]), salvage=float(v["eq_salv"]), life_cycles=float(v["eq_life"]),
-            utilization=float(v["eq_util"]), rental_rate_per_shift=float(v["eq_rent"])))
-    rho = float(v["rho"])
-    price_basis = str(v["price_basis"])
-    price = pert(float(v["p_min"]), float(v["p_mode"]), float(v["p_max"]))
-    purity = (pert(float(v["q_min"]), float(v["q_mode"]), float(v["q_max"])) if price_basis == "reference" else 1.0)
-    n_hh = v["n_hh"]
+        equipment = [E2.EquipmentItem("main_equipment", v["eq_mode"], miner_share=v["eq_share"],
+                     acquisition=v["eq_acq"], salvage=v["eq_salv"], life_cycles=v["eq_life"],
+                     utilization=v["eq_util"], rental_rate_per_shift=v["eq_rent"])]
+    share = {"50/50": .5, "60/40": .6, "65/35": .65}.get(v.get("share_preset"), v["s_m"])
     return E2.Inputs(
-        n_c=v["n_c"], D_c=v["D_c"], hours_per_worker_shift=float(v["h"]),
-        calendar_days_per_cycle=v.get("calendar_days"),
+        n_c=v["n_c"], batch_timing=timing, D_c=1 if batch else v["D_c"],
+        hours_per_worker_shift=8. if batch else v["h"], calendar_days_per_cycle=None if batch else v["calendar_days"],
+        s_m=share, tribute_base=v["tribute_base"], yield_ord=y, zero=zero, pi_J=v["pi_J"], jackpot=jack,
+        price_basis=v["price_basis"], price=pert("p"), purity=pert("q") if v["price_basis"] == "reference" else 1.,
+        costs=costs, equipment=equipment, dependence=v["dependence"], rho_spearman=rho.tolist(),
         reserve_mode=v.get("reserve_mode", "none"),
         reserve_location=None if v.get("reserve_location", "choose") == "choose" else v["reserve_location"],
         reserve_priority=None if v.get("reserve_priority", "choose") == "choose" else v["reserve_priority"],
-        reserve_custom_per_cycle=v.get("reserve_custom", 0.0),
-        s_m=float(v["s_m"]), tribute_base=str(v["tribute_base"]),
-        yield_ord=y, zero=zero, pi_J=float(v["pi_J"]), jackpot=jack,
-        price_basis=price_basis, price=price, purity=purity,
-        costs=costs, equipment=equipment, rho_spearman=[[1.0, rho], [rho, 1.0]],
-        dependence=str(v["dependence"]),
-        W_opp=float(v["W_opp"]), W_opp_source=str(v.get("W_src", "")), W_opp_date=str(v.get("W_date", "")),
-        hh_need_per_household_day=float(v["hh_need"]), n_households=None if n_hh == 0 else n_hh,
-        nonmining_income_per_household_day=float(v["nonmining"]),
-        provenance=effective_tags(v, preset) if preset else {},
-    )
+        reserve_custom_per_cycle=v.get("reserve_custom", 0.),
+        W_opp=v["W_opp"], W_opp_source=v.get("W_src", ""), W_opp_date=v.get("W_date", ""),
+        hh_need_per_household_day=v["hh_need"], n_households=None if batch or v["n_hh"] == 0 else v["n_hh"],
+        nonmining_income_per_household_day=0. if batch else v["nonmining"],
+        provenance=effective_tags(v, preset) if preset else {})
 
 
 def run_v2(v: Dict[str, object], preset: Optional[str] = None) -> Tuple[E2.Inputs, E2.Result]:
@@ -253,6 +271,7 @@ def interpretation_text(res: E2.Result, inp: E2.Inputs, n_assumed: int) -> str:
 
 
 def messages(res: E2.Result, tags: Dict[str, str]) -> List[Tuple[str, str]]:
+    """Build (streamlit level, text) message pairs for warnings and convergence/benchmark notices."""
     out = [("warning", w) for w in res.warnings]
     if not res.summary["converged"]:
         out.append(("warning", "Monte Carlo convergence was not reached; do not quote these probabilities without "
@@ -264,6 +283,7 @@ def messages(res: E2.Result, tags: Dict[str, str]) -> List[Tuple[str, str]]:
 
 
 def risk_band_text(res: E2.Result) -> str:
+    """One-line illustrative risk-band summary against the wage benchmark."""
     band = res.summary["risk_band_vs_wage"]
     meet = 1.0 - res.summary["P_labor_return_below_wage"]
     return (f"Illustrative band: **{band}** (benchmark met in {meet:.1%} of cycles; cut-offs 67% / 34% are the expert "
@@ -276,11 +296,12 @@ def risk_band_text(res: E2.Result) -> str:
 THRESHOLD_ROWS = [
     ("Operating break-even yield", "Y_BE", "Yield at which the miner group's profit is zero"),
     ("Opportunity-wage yield", "Y_W", "Yield at which the return equals the wage benchmark per person-hour"),
-    ("Household yield (economic profit)", "Y_HH", "Yield at which economic profit, including depreciation, meets household needs; not a cash threshold"),
+    ("Household economic-adequacy yield threshold", "Y_HH", "Yield at which economic profit, including depreciation, meets household needs; not a cash threshold"),
 ]
 
 
 def thresholds_table(res: E2.Result) -> pd.DataFrame:
+    """Build the table of the three yield thresholds with medians and 5th-95th percentiles."""
     rows = []
     for name, key, meaning in THRESHOLD_ROWS:
         a = res.arrays[key]
@@ -291,12 +312,14 @@ def thresholds_table(res: E2.Result) -> pd.DataFrame:
 
 
 def risk_table(res: E2.Result) -> pd.DataFrame:
+    """Build the table of risk probabilities with their labels and ± 2 MCSE bounds."""
     s = res.summary
     return pd.DataFrame([{"Output": E2.LABELS[k], "Probability": f"{s[k]:.2%}",
                           "± 2 MCSE": f"{2 * s['MCSE_' + k]:.2%}"} for k in E2.PROB_KEYS])
 
 
 def return_table(res: E2.Result) -> pd.DataFrame:
+    """Build the table of economic-return-per-person-hour summary statistics."""
     s = res.summary
     return pd.DataFrame([
         {"Statistic (PHP per person-hour)": "Median", "Value": round(s["E_median"], 2)},
@@ -324,7 +347,19 @@ def cash_table(res: E2.Result) -> pd.DataFrame:
                          for key, label in labels.items()])
 
 
+def timing_table(res: E2.Result) -> pd.DataFrame:
+    """Build the table of batch timing and household-requirement means/medians."""
+    labels = {"working_days": "Active working days", "idle_days": "Idle days",
+              "calendar_days_per_cycle": "Calendar days", "total_shifts": "Total shifts",
+              "operating_hours": "Operating hours", "L_person_hours": "Labor (person-hours)",
+              "B_HH": "Household consumption requirement (PHP)"}
+    return pd.DataFrame([{"Measure": label, "Mean": res.summary[f"{key}_mean"],
+                          "Median": res.summary[f"{key}_median"]}
+                         for key, label in labels.items() if f"{key}_mean" in res.summary])
+
+
 def assumed_inputs(tags: Dict[str, str]) -> List[str]:
+    """Sorted names of every input tagged 'assumed'."""
     return sorted(k for k, t in tags.items() if t == "assumed")
 
 
@@ -362,6 +397,7 @@ def fig_return_density(E: np.ndarray, W: float, title: str = "Labor return per p
 
 
 def fig_yield_exceedance(Y: np.ndarray, thresholds: Dict[str, float]) -> plt.Figure:
+    """Plot the empirical exceedance curve of yield Y against the three threshold medians."""
     fig, ax = plt.subplots(figsize=(7.5, 4.2))
     ys = np.sort(Y[: min(len(Y), 60_000)])
     p = 1.0 - np.arange(len(ys)) / len(ys)
@@ -398,6 +434,7 @@ def fig_stability(stage: pd.DataFrame) -> plt.Figure:
 
 
 def fig_rank_sensitivity(rank: Dict[str, float]) -> plt.Figure:
+    """Plot a horizontal bar chart of Spearman rank correlations with the labor return."""
     fig, ax = plt.subplots(figsize=(7.5, 3.6))
     items = list(rank.items())[::-1]
     names = [k for k, _ in items]
@@ -423,7 +460,10 @@ def export_csv(res: E2.Result, max_rows: int = 5_000) -> bytes:
         "cycle_id": np.arange(1, m + 1),
         "yield_g": a["Y"][:m], "purity_q": a["q"][:m], "price_php_per_g": a["P"][:m],
         "miner_costs_php": a["C_eff"][:m], "miner_profit_php": a["Pi"][:m],
-        "calendar_days_per_cycle": res.summary["calendar_days_per_cycle"],
+        **{key: a[key][:m] for key in E2.TIMING_KEYS if key in a},
+        **{key: values[:m] for key, values in a.items() if key.startswith(("rate::", "cost::"))},
+        "valuation_mass_g": a["F"][:m],
+        "valuation_mass_label": res.manifest["valuation_mass_label"],
         **{f"{key}_php": a[key][:m] for key in ("cash_cost_total", "cash_cost_miner",
            "depreciation_total", "depreciation_miner", "cash_before_reserve", "cash_after_reserve",
            "reserve_planned", "reserve_funded", "reserve_shortfall", "reserve_miner_contribution")},
@@ -434,6 +474,7 @@ def export_csv(res: E2.Result, max_rows: int = 5_000) -> bytes:
 
 
 def export_manifest(res: E2.Result, extras: Optional[dict] = None) -> bytes:
+    """Serialize the run manifest, summary and warnings (plus any `extras`) to JSON bytes."""
     doc = {"dashboard_version": DASHBOARD_VERSION, **res.manifest, "summary": E2._jsonable(res.summary),
            "warnings": list(res.warnings), **(extras or {})}
     return json.dumps(E2._jsonable(doc), indent=2, default=str).encode("utf-8")
@@ -442,11 +483,11 @@ def export_manifest(res: E2.Result, extras: Optional[dict] = None) -> bytes:
 # --------------------------------------------------------------------------------------
 # Legacy V1.0 (frozen) -- kept for comparison, relabelled
 # --------------------------------------------------------------------------------------
-LEGACY_DEFAULTS = dict(H=8, T=0.85, Cfamily=44.80, W=65.63, Cfixed=80.0, delta=1.10, Cfuel=160.0, alpha=0.02,
-                       Gmin=0.33, Gsub=1.45, Gjack=19.47, eta=0.95, Pmin=7282.35, Pmax=8900.65, N=100_000)
+LEGACY_DEFAULTS = legacy_synthetic_values()
 
 
 def legacy_errors(v: Dict[str, float]) -> List[str]:
+    """Validate legacy V1.0 inputs for required orderings; return a list of error messages."""
     errs = []
     if not v["Gmin"] < v["Gsub"]:
         errs.append("Typical minimum yield must be strictly lower than typical maximum yield.")
@@ -458,6 +499,7 @@ def legacy_errors(v: Dict[str, float]) -> List[str]:
 
 
 def run_legacy(v: Dict[str, float]) -> dict:
+    """Run the frozen legacy V1.0 Monte Carlo simulation from UI values `v`."""
     return legacy_v1.run_monte_carlo(
         H=v["H"], T=v["T"], Cfamily=v["Cfamily"], opportunity_wage=v["W"], Cfixed=v["Cfixed"], delta=v["delta"],
         Cfuel=v["Cfuel"], alpha=v["alpha"], Gf_min=v["Gmin"], Gf_subsistence_max=v["Gsub"],
@@ -466,7 +508,7 @@ def run_legacy(v: Dict[str, float]) -> dict:
 
 LEGACY_FLAWS_MD = """
 **Why V1.0 is kept only for comparison**
-* The yield lognormal assumes the typical minimum is the 5th percentile and the maximum the 99th; respondents never said that.
+* The yield lognormal assumes the typical minimum is the 5th percentile and the maximum the 99th; these percentile assignments are model assumptions.
 * It cannot produce a zero-yield cycle, and its "jackpot" is a lognormal anchored at the typical minimum, not a tail.
 * The jackpot frequency is a heuristic clamp (0.2%–5%), not data.
 * Purity (η) is multiplied onto a farmgate price that already reflects grade.
@@ -475,33 +517,20 @@ LEGACY_FLAWS_MD = """
 """
 
 ABOUT_MD = """
-**What this dashboard is**
-A simulation tool that turns the inputs you enter into probabilities and yield thresholds for a single production cycle.
+### Model scope and assumptions
+Every iteration represents a complete production batch. The crew attends every scheduled shift.
+Working days follow discretized Beta-PERT; independent nonnegative idle days extend calendar time.
+Daily shift counts use the ten-day frequency grid; one conditional duration applies to all shifts that day.
+Batch yield is sampled directly and is independent of timing and valuation.
 
-**Accounting meanings**
-Profit and hourly return include purchased-equipment depreciation. Cash excludes depreciation;
-rentals remain cash expenses. Household yield is an economic-profit threshold. Separate probabilities
-show household cash shortfall before and after a reserve, reserve underfunding, and meeting both targets.
-Reserve amounts refer to the common fund before sharing or the miner fund after sharing, as selected.
-Common reserves use cash after operating expenses and reduce the revenue base available for sharing.
-Household-first protects only the modeled miner households; reserve-first may reduce their available cash.
-No reserve balance, borrowing, or equipment purchases are simulated. Calendar days include idle days
-within the period covered by this cycle; working shifts still determine labor and rentals.
+Expense rates describe the whole operation. The Gaussian copula links rates before multiplication
+by operating exposure. Realized total-expense correlations can differ from the rate targets.
+Worksite food is additional consumption excluded from the household benchmark.
 
-**What the results are**
-Scenario results under the stated inputs. Inputs marked 🟠 *assumed* were not collected in the pilot (crew size, costs,
-zero-yield and jackpot frequencies, yield mode, dependence).
+Hourly wage adequacy, household economic adequacy, and household cash adequacy are distinct.
+Economic profit includes depreciation; cash excludes it and accounts for funded reserves.
+The reserve is a single-batch allocation without accumulated balances or borrowing.
 
-**What the results are not**
-* Not findings about Pantukan miners: the pilot was a non-representative convenience sample of 21 people.
-* Not an empirical validation (Domain G needs Phase 2 field data); passing tests verify the code, not the model.
-* Not a poverty-trap model: a one-cycle probability of earning below a benchmark is not persistence over time.
-* Not advice to stop, continue or invest.
-
-| Kind of content | Where it appears |
-|---|---|
-| Observed pilot data | inputs tagged 🟢 pilot |
-| Simulated predictions | probabilities, percentiles and thresholds in the result tabs |
-| Assumptions | inputs tagged 🟠 assumed or 🟣 user-entered |
-| Normative thresholds | wage benchmark, illustrative risk-band cut-offs |
+All presets are synthetic demonstrations. Tests verify equations and software behavior;
+empirical validation requires independently obtained observations. External benchmarks need a source and date.
 """
