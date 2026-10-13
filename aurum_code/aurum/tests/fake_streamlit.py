@@ -13,10 +13,11 @@ import types
 
 
 class StopApp(Exception):
-    pass
+    """Raised by the fake st.stop() to unwind out of main(), mimicking Streamlit's behavior."""
 
 
 class _Ctx:
+    """No-op context manager standing in for Streamlit's sidebar/column/expander/spinner blocks."""
     def __enter__(self):
         return self
 
@@ -25,6 +26,7 @@ class _Ctx:
 
 
 class _State(dict):
+    """Dict-backed stand-in for st.session_state, supporting attribute-style access."""
     def __getattr__(self, k):
         try:
             return self[k]
@@ -36,6 +38,7 @@ class _State(dict):
 
 
 def _check_numeric(label, value, min_value, max_value, step, override_present):
+    """Raise if a numeric widget mixes int/float types or its default falls outside min/max."""
     nums = [x for x in (value, min_value, max_value, step) if x is not None]
     kinds = {float if isinstance(x, float) else int for x in nums if not isinstance(x, bool)}
     if len(kinds) > 1:
@@ -49,6 +52,7 @@ def _check_numeric(label, value, min_value, max_value, step, override_present):
 
 
 class Fake:
+    """Records every Streamlit call and returns widget defaults or overrides, mimicking the real module."""
     def __init__(self, overrides=None, submit=True, press=(), session_state=None):
         self.log = []
         self.overrides = overrides or {}
@@ -60,9 +64,11 @@ class Fake:
 
     # ---- helpers ----
     def _rec(self, kind, *args, **kw):
+        """Append a (kind, args, kwargs) entry to the call log."""
         self.log.append((kind, args, kw))
 
     def _override(self, key):
+        """Look up a test override for `key` (or its unprefixed name); return (found, value)."""
         if key is None:
             return False, None
         name = key.split("__")[-1]
@@ -72,12 +78,14 @@ class Fake:
         return False, None
 
     def _register(self, key):
+        """Record a widget key, raising like real Streamlit on a duplicate key."""
         if key is not None:
             if key in self._keys:
                 raise RuntimeError(f"DuplicateWidgetID: {key}")
             self._keys.add(key)
 
     def texts(self):
+        """All text-like content recorded for display calls, as a flat list of strings."""
         out = []
         for kind, args, kw in self.log:
             if kind in ("markdown", "caption", "subheader", "header", "title", "info", "warning", "error", "success",
@@ -86,21 +94,42 @@ class Fake:
         return out
 
     def calls(self, kind):
+        """All recorded (args, kwargs) pairs for calls of the given `kind`."""
         return [(a, k) for kd, a, k in self.log if kd == kind]
 
     # ---- layout ----
-    def set_page_config(self, **kw): self._rec("set_page_config", **kw)
-    def spinner(self, *a, **k): return _Ctx()
-    def expander(self, label, expanded=False): self._rec("expander", label); return _Ctx()
+    def set_page_config(self, **kw):
+        """Fake st.set_page_config: just log the call."""
+        self._rec("set_page_config", **kw)
+
+    def spinner(self, *a, **k):
+        """Fake st.spinner: a no-op context manager."""
+        return _Ctx()
+
+    def expander(self, label, expanded=False):
+        """Fake st.expander: log the label and return a no-op context manager."""
+        self._rec("expander", label); return _Ctx()
+
     def columns(self, spec):
+        """Fake st.columns: return one no-op context manager per column."""
         n = spec if isinstance(spec, int) else len(spec)
         return [_Ctx() for _ in range(n)]
-    def tabs(self, labels): self._rec("tabs", *labels); return [_Ctx() for _ in labels]
-    def form(self, key=None, **k): self._register("form::" + str(key)); return _Ctx()
-    def stop(self): raise StopApp()
+
+    def tabs(self, labels):
+        """Fake st.tabs: log the labels and return one no-op context manager per tab."""
+        self._rec("tabs", *labels); return [_Ctx() for _ in labels]
+
+    def form(self, key=None, **k):
+        """Fake st.sidebar.form: register the form key and return a no-op context manager."""
+        self._register("form::" + str(key)); return _Ctx()
+
+    def stop(self):
+        """Fake st.stop: raise StopApp to unwind out of main(), like Streamlit's real stop()."""
+        raise StopApp()
 
     # ---- display ----
     def _disp(kind):
+        """Build a logging-only method for a simple display call of the given `kind`."""
         def f(self, *a, **k): self._rec(kind, *a, **k)
         return f
     title = _disp("title"); markdown = _disp("markdown"); caption = _disp("caption"); subheader = _disp("subheader")
@@ -110,6 +139,7 @@ class Fake:
 
     # ---- widgets ----
     def number_input(self, label, min_value=None, max_value=None, value=0, step=None, key=None, help=None, format=None, disabled=False):
+        """Fake st.number_input: register the key, validate numeric rules, and return the value or its override."""
         self._register(key)
         ok, ov = self._override(key)
         _check_numeric(label, value, min_value, max_value, step, ok)
@@ -119,6 +149,7 @@ class Fake:
         return ov if ok else value
 
     def slider(self, label, min_value=None, max_value=None, value=None, step=None, key=None, help=None):
+        """Fake st.slider: register the key, validate numeric rules, and return the value or its override."""
         self._register(key)
         ok, ov = self._override(key)
         _check_numeric(label, value, min_value, max_value, step, ok)
@@ -126,6 +157,7 @@ class Fake:
         return ov if ok else value
 
     def selectbox(self, label, options, index=0, key=None, help=None):
+        """Fake st.selectbox: register the key, validate the index, and return the option or its override."""
         self._register(key)
         options = list(options)
         if not 0 <= index < len(options):
@@ -135,24 +167,29 @@ class Fake:
         return ov if ok else options[index]
 
     def radio(self, label, options, index=0, key=None, help=None):
+        """Fake st.radio: delegate to selectbox since both pick one of `options`."""
         return self.selectbox(label, options, index=index, key=key, help=help)
 
     def text_input(self, label, value="", key=None, help=None):
+        """Fake st.text_input: register the key and return the value or its override."""
         self._register(key)
         ok, ov = self._override(key)
         self._rec("text_input", label, key=key)
         return ov if ok else value
 
     def form_submit_button(self, label, *a, **k):
+        """Fake st.form_submit_button: log the click and return whether the form was submitted."""
         self._rec("form_submit_button", label)
         return self.submit(label) if callable(self.submit) else bool(self.submit)
 
     def button(self, label, *a, **k):
+        """Fake st.button: log the click and return whether `label` is in the pressed set."""
         self._rec("button", label)
         return label in self.press
 
 
 class _Sidebar:
+    """Fake st.sidebar: forwards every attribute access to the parent Fake instance."""
     def __init__(self, parent):
         self._p = parent
 

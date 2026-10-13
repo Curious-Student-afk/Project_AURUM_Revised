@@ -48,11 +48,13 @@ BASIS_LABELS = {"per_batch": "PHP/batch", "per_shift": "PHP/shift",
 
 
 def correlation_keys():
+    """List (i, j, widget key) triples for every pairwise cost-rate correlation above the diagonal."""
     names = list(COST_FIELDS)
     return [(i, j, f"rho_{names[i]}_{names[j]}") for i in range(len(names)) for j in range(i + 1, len(names))]
 
 
 def param_tags(preset: str) -> Dict[str, str]:
+    """Default provenance tag ('synthetic') for every preset parameter except run-control fields."""
     return {k: "synthetic" for k in preset_values(preset)
             if k not in ("seed", "tol", "n_max", "W_src", "W_date")}
 
@@ -121,6 +123,7 @@ def values_from_inputs(inp: E2.Inputs) -> Dict[str, object]:
 
 
 def pert_values(pert):
+    """Return a PERT's (min, mode, max) tuple."""
     return pert.a, pert.m, pert.b
 
 
@@ -143,6 +146,7 @@ def tag_for(name: str, value, preset: str) -> str:
 
 
 def effective_tags(values: Dict[str, object], preset: str) -> Dict[str, str]:
+    """Provenance tags for the current form `values`, resolving the share preset first."""
     effective = dict(values)
     if values.get("share_preset") in ("50/50", "60/40", "65/35"):
         effective["s_m"] = {"50/50": .5, "60/40": .6, "65/35": .65}[values["share_preset"]]
@@ -193,6 +197,7 @@ def build_inputs(v: Dict[str, object], preset: Optional[str] = None) -> E2.Input
     if errs:
         raise E2.InputError("\n".join(errs))
     def pert(prefix):
+        """Build a PERT from the `{prefix}_min/mode/max` widget values."""
         return E2.PERT(*(v[f"{prefix}_{s}"] for s in ("min", "mode", "max")))
     timing = (E2.BatchTiming(pert("work"), pert("idle"), tuple(v[f"days_{d}"] for d in (1, 2, 3)),
                             {d: pert(f"h{d}") for d in (1, 2, 3)}) if batch else None)
@@ -266,6 +271,7 @@ def interpretation_text(res: E2.Result, inp: E2.Inputs, n_assumed: int) -> str:
 
 
 def messages(res: E2.Result, tags: Dict[str, str]) -> List[Tuple[str, str]]:
+    """Build (streamlit level, text) message pairs for warnings and convergence/benchmark notices."""
     out = [("warning", w) for w in res.warnings]
     if not res.summary["converged"]:
         out.append(("warning", "Monte Carlo convergence was not reached; do not quote these probabilities without "
@@ -277,6 +283,7 @@ def messages(res: E2.Result, tags: Dict[str, str]) -> List[Tuple[str, str]]:
 
 
 def risk_band_text(res: E2.Result) -> str:
+    """One-line illustrative risk-band summary against the wage benchmark."""
     band = res.summary["risk_band_vs_wage"]
     meet = 1.0 - res.summary["P_labor_return_below_wage"]
     return (f"Illustrative band: **{band}** (benchmark met in {meet:.1%} of cycles; cut-offs 67% / 34% are the expert "
@@ -294,6 +301,7 @@ THRESHOLD_ROWS = [
 
 
 def thresholds_table(res: E2.Result) -> pd.DataFrame:
+    """Build the table of the three yield thresholds with medians and 5th-95th percentiles."""
     rows = []
     for name, key, meaning in THRESHOLD_ROWS:
         a = res.arrays[key]
@@ -304,12 +312,14 @@ def thresholds_table(res: E2.Result) -> pd.DataFrame:
 
 
 def risk_table(res: E2.Result) -> pd.DataFrame:
+    """Build the table of risk probabilities with their labels and ± 2 MCSE bounds."""
     s = res.summary
     return pd.DataFrame([{"Output": E2.LABELS[k], "Probability": f"{s[k]:.2%}",
                           "± 2 MCSE": f"{2 * s['MCSE_' + k]:.2%}"} for k in E2.PROB_KEYS])
 
 
 def return_table(res: E2.Result) -> pd.DataFrame:
+    """Build the table of economic-return-per-person-hour summary statistics."""
     s = res.summary
     return pd.DataFrame([
         {"Statistic (PHP per person-hour)": "Median", "Value": round(s["E_median"], 2)},
@@ -338,6 +348,7 @@ def cash_table(res: E2.Result) -> pd.DataFrame:
 
 
 def timing_table(res: E2.Result) -> pd.DataFrame:
+    """Build the table of batch timing and household-requirement means/medians."""
     labels = {"working_days": "Active working days", "idle_days": "Idle days",
               "calendar_days_per_cycle": "Calendar days", "total_shifts": "Total shifts",
               "operating_hours": "Operating hours", "L_person_hours": "Labor (person-hours)",
@@ -348,6 +359,7 @@ def timing_table(res: E2.Result) -> pd.DataFrame:
 
 
 def assumed_inputs(tags: Dict[str, str]) -> List[str]:
+    """Sorted names of every input tagged 'assumed'."""
     return sorted(k for k, t in tags.items() if t == "assumed")
 
 
@@ -385,6 +397,7 @@ def fig_return_density(E: np.ndarray, W: float, title: str = "Labor return per p
 
 
 def fig_yield_exceedance(Y: np.ndarray, thresholds: Dict[str, float]) -> plt.Figure:
+    """Plot the empirical exceedance curve of yield Y against the three threshold medians."""
     fig, ax = plt.subplots(figsize=(7.5, 4.2))
     ys = np.sort(Y[: min(len(Y), 60_000)])
     p = 1.0 - np.arange(len(ys)) / len(ys)
@@ -421,6 +434,7 @@ def fig_stability(stage: pd.DataFrame) -> plt.Figure:
 
 
 def fig_rank_sensitivity(rank: Dict[str, float]) -> plt.Figure:
+    """Plot a horizontal bar chart of Spearman rank correlations with the labor return."""
     fig, ax = plt.subplots(figsize=(7.5, 3.6))
     items = list(rank.items())[::-1]
     names = [k for k, _ in items]
@@ -460,6 +474,7 @@ def export_csv(res: E2.Result, max_rows: int = 5_000) -> bytes:
 
 
 def export_manifest(res: E2.Result, extras: Optional[dict] = None) -> bytes:
+    """Serialize the run manifest, summary and warnings (plus any `extras`) to JSON bytes."""
     doc = {"dashboard_version": DASHBOARD_VERSION, **res.manifest, "summary": E2._jsonable(res.summary),
            "warnings": list(res.warnings), **(extras or {})}
     return json.dumps(E2._jsonable(doc), indent=2, default=str).encode("utf-8")
@@ -472,6 +487,7 @@ LEGACY_DEFAULTS = legacy_synthetic_values()
 
 
 def legacy_errors(v: Dict[str, float]) -> List[str]:
+    """Validate legacy V1.0 inputs for required orderings; return a list of error messages."""
     errs = []
     if not v["Gmin"] < v["Gsub"]:
         errs.append("Typical minimum yield must be strictly lower than typical maximum yield.")
@@ -483,6 +499,7 @@ def legacy_errors(v: Dict[str, float]) -> List[str]:
 
 
 def run_legacy(v: Dict[str, float]) -> dict:
+    """Run the frozen legacy V1.0 Monte Carlo simulation from UI values `v`."""
     return legacy_v1.run_monte_carlo(
         H=v["H"], T=v["T"], Cfamily=v["Cfamily"], opportunity_wage=v["W"], Cfixed=v["Cfixed"], delta=v["delta"],
         Cfuel=v["Cfuel"], alpha=v["alpha"], Gf_min=v["Gmin"], Gf_subsistence_max=v["Gsub"],

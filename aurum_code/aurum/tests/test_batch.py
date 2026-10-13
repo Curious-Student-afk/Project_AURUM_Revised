@@ -15,10 +15,12 @@ from scenarios import batch_synthetic, fixed_synthetic, default_timing
 
 
 def constant(x):
+    """Return a degenerate PERT(x, x, x) that always samples to x."""
     return E.PERT(x, x, x)
 
 
 def deterministic(**kw):
+    """Build a zero-variance batch scenario with known timing, costs and household need."""
     base = dataclasses.replace(batch_synthetic(), n_c=2,
         batch_timing=E.BatchTiming(constant(2), constant(1.5), (0, 10, 0),
                                   {1: constant(8), 2: constant(3), 3: constant(2)}),
@@ -33,6 +35,7 @@ def deterministic(**kw):
 
 class TestBatchTiming(unittest.TestCase):
     def test_rounding_boundary_is_half_up(self):
+        """Working-day counts round floor(PERT + 0.5), so exact half-days round up."""
         inp = deterministic(batch_timing=E.BatchTiming(E.PERT(1, 2, 3), constant(0), (10, 0, 0),
                                {1: constant(8), 2: constant(4), 3: constant(2)}))
         with patch.object(inp.batch_timing.work_days, 'sample', return_value=np.array([1.49, 1.5, 2.49, 2.5, 3.])):
@@ -42,6 +45,7 @@ class TestBatchTiming(unittest.TestCase):
         np.testing.assert_array_equal(a['L_person_hours'], [16, 32, 32, 48, 48])
 
     def test_each_day_gets_an_independent_count_and_conditional_hours(self):
+        """Each working day draws its own shift count and that count's conditional hours."""
         inp = deterministic(batch_timing=E.BatchTiming(constant(2), constant(0), (5, 0, 5),
                                   {1: constant(2), 2: constant(4), 3: constant(1)}))
         a = E.sample_timing(inp, np.random.default_rng(14), 40_000)
@@ -51,6 +55,7 @@ class TestBatchTiming(unittest.TestCase):
         np.testing.assert_array_equal(a['operating_hours'], (a['total_shifts'] + 6) / 2)
 
     def test_default_schedule_constraints_and_positive_labor(self):
+        """The default synthetic schedule obeys its own day/shift/hour bounds and yields positive labor."""
         inp = batch_synthetic()
         a = E.sample_timing(inp, np.random.default_rng(8), 30_000)
         self.assertTrue(np.all(a['calendar_days_per_cycle'] >= a['working_days']))
@@ -62,6 +67,7 @@ class TestBatchTiming(unittest.TestCase):
         self.assertAlmostEqual(a['idle_days'].mean(), inp.batch_timing.idle_days.mean, delta=.02)
 
     def test_invalid_timing_and_conflicting_legacy_inputs_rejected(self):
+        """Malformed BatchTiming configurations and batch/fixed-timing conflicts raise InputError."""
         t = default_timing()
         bad = [dataclasses.replace(t, work_days=E.PERT(0, 1, 3)),
                dataclasses.replace(t, work_days=E.PERT(1, 1.5, 3)),
@@ -87,6 +93,7 @@ class TestBatchTiming(unittest.TestCase):
                 E.validate(dataclasses.replace(batch_synthetic(), **kw))
 
     def test_timing_does_not_multiply_or_change_batch_yield_draws(self):
+        """Changing batch timing leaves yield draws untouched and does not scale them by shifts."""
         a = batch_synthetic()
         b = dataclasses.replace(a, batch_timing=dataclasses.replace(a.batch_timing, work_days=constant(10)))
         x, y = E.run(a, n_fixed=2000), E.run(b, n_fixed=2000)
@@ -99,6 +106,7 @@ class TestBatchTiming(unittest.TestCase):
 
 class TestExpenseAndAccounting(unittest.TestCase):
     def test_every_expense_basis_and_equipment_are_counted_once(self):
+        """Every expense basis and both equipment modes resolve to the expected cost exactly once."""
         inp = deterministic(equipment=[E.EquipmentItem('rental', 'rented', rental_rate_per_shift=7),
                E.EquipmentItem('owned', 'purchased', acquisition=1000, life_cycles=10)])
         a = E.run(inp, n_fixed=30).arrays
@@ -114,6 +122,7 @@ class TestExpenseAndAccounting(unittest.TestCase):
         np.testing.assert_array_equal(a['cash_before_reserve'], -233)
 
     def test_idle_days_change_household_and_calendar_cost_only(self):
+        """Longer idle days raise household need and calendar-day costs without affecting working-time costs."""
         a = deterministic()
         b = dataclasses.replace(a, batch_timing=dataclasses.replace(a.batch_timing, idle_days=constant(4.5)))
         x, y = E.run(a, n_fixed=20).arrays, E.run(b, n_fixed=20).arrays
@@ -123,6 +132,7 @@ class TestExpenseAndAccounting(unittest.TestCase):
         np.testing.assert_array_equal(y['cost::calendar'] - x['cost::calendar'], 150)
 
     def test_copula_targets_rates_and_keeps_rate_marginals(self):
+        """The Gaussian copula achieves the targeted rate correlation while preserving each rate's marginal."""
         inp = dataclasses.replace(batch_synthetic(), costs=[
             E.CostItem('a', pert=E.PERT(10, 20, 30), basis='per_working_day'),
             E.CostItem('b', pert=E.PERT(5, 10, 15), basis='per_calendar_day')],
@@ -134,6 +144,7 @@ class TestExpenseAndAccounting(unittest.TestCase):
         np.testing.assert_allclose(a['cost::b'], a['rate::b'] * a['calendar_days_per_cycle'])
 
     def test_staged_probabilities_thresholds_and_reserves_use_each_draw(self):
+        """Staged-N probabilities, the three thresholds, and reserve accounting hold for every draw and policy combination."""
         for base in ('gross', 'net'):
             for location in ('before_sharing', 'after_sharing'):
                 for priority in ('household_first', 'reserve_first'):
@@ -167,6 +178,7 @@ class TestExpenseAndAccounting(unittest.TestCase):
                             self.assertEqual(r.summary[key], r.stage_table.iloc[-1][key])
 
     def test_fixed_api_scalar_summaries_and_new_batch_summaries(self):
+        """Fixed-timing runs keep their scalar summary fields; batch-timing runs report mean/median arrays instead."""
         old = E.run(fixed_synthetic(), n_fixed=20)
         new = E.run(deterministic(), n_fixed=20)
         self.assertEqual(old.summary['L_person_hours'], 32)
@@ -181,6 +193,7 @@ class TestExpenseAndAccounting(unittest.TestCase):
                 getattr(deterministic(), method)()
 
     def test_bad_cost_bases_and_unknown_fixed_working_exposure_rejected(self):
+        """Unknown cost bases and per-working-day costs without batch_timing both raise InputError."""
         for inp in (dataclasses.replace(batch_synthetic(), costs=[E.CostItem('x', fixed=1, basis='unknown')]),
                     dataclasses.replace(fixed_synthetic(), costs=[E.CostItem('x', fixed=1, basis='per_working_day')])):
             with self.assertRaises(E.InputError):
@@ -189,6 +202,7 @@ class TestExpenseAndAccounting(unittest.TestCase):
 
 class TestBatchDashboard(unittest.TestCase):
     def test_csv_matches_draws_and_manifest_names_rate_units(self):
+        """The exported CSV matches the simulated arrays, and the manifest records each rate's expense basis."""
         r = E.run(batch_synthetic(), n_fixed=40)
         frame = pd.read_csv(io.BytesIO(DL.export_csv(r, 30)))
         for key in E.TIMING_KEYS:
@@ -203,6 +217,7 @@ class TestBatchDashboard(unittest.TestCase):
         self.assertEqual(manifest['valuation_mass_label'], 'recovered gold mass')
 
     def test_share_presets_and_named_matrix_map_exactly(self):
+        """Share presets set s_m and its provenance correctly, and the named correlation matrix maps exactly."""
         v = dict(DL.preset_values(DL.PRESETS[0]))
         for label, share in (('50/50', .5), ('60/40', .6), ('65/35', .65), ('Custom', .73)):
             inp = DL.build_inputs({**v, 'share_preset': label, 's_m': .73, 'rho_fuel_food': .4}, DL.PRESETS[0])
@@ -213,6 +228,7 @@ class TestBatchDashboard(unittest.TestCase):
             E.validate(inp)
 
     def test_invalid_batch_widgets_are_not_coerced(self):
+        """Invalid batch-timing widget values (wrong type, NaN, infinity) are rejected, not silently coerced."""
         v = dict(DL.preset_values(DL.PRESETS[0]))
         for key, value in (('work_mode', 2.5), ('ym', float('nan')), ('days_1', True), ('idle_max', float('nan')),
                            ('h3_max', 9), ('rho_fuel_food', float('inf'))):

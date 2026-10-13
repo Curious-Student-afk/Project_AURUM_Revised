@@ -5,10 +5,12 @@ from streamlit.testing.v1 import AppTest
 
 
 def widget(collection, suffix):
+    """Return the single widget in `collection` whose key ends with `__suffix`."""
     return next(w for w in collection if w.key and w.key.endswith('__' + suffix))
 
 
 def submit(app):
+    """Click the model's submit button, run the app, and assert no exception was raised."""
     next(b for b in app.button if b.label == 'Run Project AURUM model').click().run()
     assert not app.exception, [e.message for e in app.exception]
 

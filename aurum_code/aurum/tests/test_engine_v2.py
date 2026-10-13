@@ -26,6 +26,7 @@ from scenarios import fixed_synthetic, synthetic_profiles  # noqa: E402
 
 
 def base(**kw):
+    """Synthetic fixed-timing Inputs with a sourced wage benchmark, with fields overridden by `kw`."""
     inp = fixed_synthetic()
     inp = dataclasses.replace(inp, W_opp_source="test", W_opp_date="test")
     return dataclasses.replace(inp, **kw) if kw else inp
@@ -35,6 +36,7 @@ class TestDistributions(unittest.TestCase):
     """Domain D (distributional identifiability) -- synthetic verification only."""
 
     def test_pert_moments_match_theory(self):
+        """Sampled PERT mean and variance match the closed-form Beta-PERT formulas."""
         p = PERT(0.3, 0.8, 1.5)
         x = p.sample(np.random.default_rng(1), 400_000)
         mu = (0.3 + 4 * 0.8 + 1.5) / 6
@@ -44,6 +46,7 @@ class TestDistributions(unittest.TestCase):
         self.assertTrue(x.min() >= 0.3 and x.max() <= 1.5)
 
     def test_pert_ppf_endpoints_and_monotone(self):
+        """The PERT quantile function is monotone increasing and matches the bounds at u=0 and u=1."""
         p = PERT(10, 40, 100)
         u = np.linspace(0.001, 0.999, 500)
         q = p.ppf(u)
@@ -52,14 +55,17 @@ class TestDistributions(unittest.TestCase):
         self.assertAlmostEqual(float(p.ppf(np.array([1.0]))[0]), 100)
 
     def test_pert_shape_properties_safe_when_degenerate(self):
+        """A degenerate PERT's alpha/beta properties are well-defined and do not raise."""
         p = PERT(5, 5, 5)
         self.assertEqual((p.alpha, p.beta), (1.0, 1.0))          # inspecting must not raise ZeroDivisionError
 
     def test_pert_degenerate_is_constant(self):
+        """A degenerate PERT(5, 5, 5) always samples to exactly 5."""
         x = PERT(5, 5, 5).sample(np.random.default_rng(1), 100)
         self.assertTrue(np.all(x == 5))
 
     def test_jackpot_truncated_no_atom_at_cap(self):
+        """The truncated-Pareto jackpot stays within [threshold, cap] with no probability mass piled at the cap."""
         j = Jackpot(30.0, 60.0, 1.5)
         x = j.sample(np.random.default_rng(2), 300_000)
         self.assertTrue(x.min() >= 30.0 and x.max() <= 60.0)
@@ -69,18 +75,21 @@ class TestDistributions(unittest.TestCase):
         self.assertAlmostEqual(np.median(x), median, delta=0.05)
 
     def test_zero_share_matches_p0_within_mcse(self):
+        """The observed zero-yield cycle share matches the fixed p0 within Monte Carlo error."""
         inp = dataclasses.replace(base(), zero=ZeroYield(p0=0.2), pi_J=0.0)
         r = run(inp, n_fixed=100_000)
         k = int(round(r.summary["observed_zero_cycle_share"] * r.summary["N"]))
         self.assertLessEqual(abs(r.summary["observed_zero_cycle_share"] - 0.2), 4 * mcse_prob(k, r.summary["N"]))
 
     def test_beta_posterior_p0_drawn_per_iteration(self):
+        """The counts-based zero-yield posterior matches Beta(prior+z, prior+n-z) and varies draw to draw."""
         z = ZeroYield(z=3, n=10)                               # posterior Beta(4, 8)
         x = z.draw_p0(np.random.default_rng(3), 200_000)
         self.assertAlmostEqual(x.mean(), 4 / 12, delta=0.003)
         self.assertGreater(x.std(), 0.1)                       # varies by draw, not one value per batch
 
     def test_zero_yield_never_causes_division_by_zero(self):
+        """Even with p0 = 1 (always zero yield), the run produces finite E and Y_BE for every cycle."""
         r = run(dataclasses.replace(base(), zero=ZeroYield(p0=1.0), pi_J=0.0), n_fixed=10_000)
         self.assertTrue(np.all(np.isfinite(r.arrays["E"])))
         self.assertTrue(np.all(np.isfinite(r.arrays["Y_BE"])))
@@ -91,10 +100,12 @@ class TestValidation(unittest.TestCase):
     """Domain F (computational robustness) -- expert report Section 8 rules."""
 
     def bad(self, **kw):
+        """Assert that validate() raises InputError for the base scenario with `kw` overridden."""
         with self.assertRaises(InputError, msg=str(kw)):
             validate(dataclasses.replace(base(), **kw))
 
     def test_rejects_impossible_inputs(self):
+        """Each individually impossible input (bad counts, shares, prices, yields, etc.) raises InputError."""
         self.bad(n_c=0)
         self.bad(D_c=0)
         self.bad(hours_per_worker_shift=0)
@@ -113,16 +124,19 @@ class TestValidation(unittest.TestCase):
         self.bad(price_basis="mystery")
 
     def test_wage_paid_worker_is_flagged_not_divided(self):
+        """s_m = 0 (a wage-paid worker) raises InputError with a message naming it explicitly."""
         with self.assertRaises(InputError) as cm:
             validate(dataclasses.replace(base(), s_m=0.0))
         self.assertIn("wage-paid", str(cm.exception))
 
     def test_reference_basis_rejects_zero_or_over_unity_purity(self):
+        """Reference-basis purity of 0, above 1, or a PERT exceeding 1 all raise InputError."""
         self.bad(price_basis="reference", price=6000.0, purity=0.0)
         self.bad(price_basis="reference", price=6000.0, purity=1.3)
         self.bad(price_basis="reference", price=6000.0, purity=PERT(0.8, 0.9, 1.2))
 
     def test_cost_rules(self):
+        """Cost items with a bad miner share, negative amount, neither/both fixed and PERT, or duplicate names raise."""
         b = base()
         self.bad(costs=[CostItem("x", 1.5, fixed=10.0)])
         self.bad(costs=[CostItem("x", 1.0, fixed=-5.0)])
@@ -132,6 +146,7 @@ class TestValidation(unittest.TestCase):
         self.assertIsNotNone(b)
 
     def test_copula_matrix_rules(self):
+        """A malformed, missing, or non-positive-definite rho_spearman matrix raises InputError."""
         b = base()
         self.bad(rho_spearman=[[1, 0.5, 0.1], [0.5, 1, 0.1], [0.1, 0.1, 1]])   # wrong size
         self.bad(rho_spearman=[[1, 0.5], [0.4, 1]])                              # not symmetric
@@ -142,6 +157,7 @@ class TestValidation(unittest.TestCase):
             validate(dataclasses.replace(three, rho_spearman=[[1, .99, -.99], [.99, 1, .99], [-.99, .99, 1]]))
 
     def test_unsourced_wage_gives_warning_not_error(self):
+        """An unsourced wage benchmark produces a warning, not a validation error."""
         w = validate(fixed_synthetic())
         self.assertTrue(any("W_opp" in x for x in w))
 
@@ -150,19 +166,23 @@ class TestEquipment(unittest.TestCase):
     """Required revision 4: purchased depreciation vs rental, never a blended markup."""
 
     def test_purchased_depreciation_formula(self):
+        """Purchased equipment cost per cycle equals (acquisition - salvage) / life_cycles * utilization."""
         eq = EquipmentItem("mill", "purchased", acquisition=10_000, salvage=1_000, life_cycles=90, utilization=0.5)
         self.assertAlmostEqual(eq.cost_per_cycle(1), (10_000 - 1_000) / 90 * 0.5)
 
     def test_rented_has_no_depreciation(self):
+        """Rented equipment cost per cycle is rental_rate_per_shift * D_c, ignoring acquisition/salvage."""
         eq = EquipmentItem("pump", "rented", rental_rate_per_shift=120, acquisition=99_999, salvage=0, life_cycles=1)
         self.assertEqual(eq.cost_per_cycle(3), 360)
 
     def test_negative_depreciation_rejected(self):
+        """Salvage value exceeding acquisition cost (negative depreciation) raises InputError."""
         inp = dataclasses.replace(base(), equipment=[EquipmentItem("x", "purchased", acquisition=100, salvage=500)])
         with self.assertRaises(InputError):
             validate(inp)
 
     def test_equipment_enters_costs_once(self):
+        """Adding a rented equipment item raises total cost by exactly its rental rate, counted once."""
         b = base()
         b2 = dataclasses.replace(b, equipment=[EquipmentItem("pump", "rented", rental_rate_per_shift=100)])
         r1 = run(b, n_fixed=10_000)
@@ -174,6 +194,7 @@ class TestAccounting(unittest.TestCase):
     """Domains B, C, E: one unit, stakeholder accounting, three separate thresholds."""
 
     def check_identities(self, inp):
+        """Assert the three threshold identities and the E*L = Pi identity hold for every draw of `inp`."""
         r = run(inp, n_fixed=20_000)
         a = r.arrays
         L, B = r.summary["L_person_hours"], r.summary["B_HH"]
@@ -188,23 +209,28 @@ class TestAccounting(unittest.TestCase):
         self.assertEqual(r.summary["P_negative_operating_return"], r.summary["P_yield_below_breakeven"])
 
     def test_threshold_identities_gross(self):
+        """The three threshold identities hold under the gross tribute base."""
         self.check_identities(base(tribute_base="gross"))
 
     def test_threshold_identities_net(self):
+        """The three threshold identities hold under the net tribute base."""
         self.check_identities(base(tribute_base="net"))
 
     def test_net_base_breakeven_independent_of_share(self):
+        """Under the net tribute base, the break-even yield does not depend on the miner share s_m."""
         a = run(base(tribute_base="net", s_m=0.5), n_fixed=10_000).arrays["Y_BE"]
         b = run(base(tribute_base="net", s_m=0.8), n_fixed=10_000).arrays["Y_BE"]
         np.testing.assert_allclose(a, b)
 
     def test_cost_allocation_separates_who_pays(self):
+        """A cost's miner_share, not its total amount, determines how much it reduces miner profit."""
         free = dataclasses.replace(base(), costs=[CostItem("fuel", 0.0, fixed=500.0)], rho_spearman=None)
         paid = dataclasses.replace(base(), costs=[CostItem("fuel", 1.0, fixed=500.0)], rho_spearman=None)
         d = run(paid, n_fixed=10_000).arrays["Pi"] - run(free, n_fixed=10_000).arrays["Pi"]
         np.testing.assert_allclose(d, -500.0)
 
     def test_price_purity_counted_once(self):
+        """Farmgate pricing ignores purity entirely; reference pricing applies it exactly once."""
         a = run(base(purity=0.5), n_fixed=10_000).arrays["E"]       # farmgate basis: purity must be ignored
         b = run(base(purity=1.0), n_fixed=10_000).arrays["E"]
         np.testing.assert_array_equal(a, b)
@@ -214,6 +240,7 @@ class TestAccounting(unittest.TestCase):
         np.testing.assert_allclose(lo, hi * 0.8)                     # reference basis: purity applied exactly once
 
     def test_group_level_scaling_with_crew_size(self):
+        """Doubling crew size doubles person-hours and halves the per-person-hour return, with profit unchanged."""
         r5 = run(base(n_c=5), n_fixed=10_000)
         r10 = run(base(n_c=10), n_fixed=10_000)
         self.assertAlmostEqual(r10.summary["L_person_hours"], 2 * r5.summary["L_person_hours"])
@@ -221,6 +248,7 @@ class TestAccounting(unittest.TestCase):
         np.testing.assert_allclose(r10.arrays["Pi"], r5.arrays["Pi"])
 
     def test_hours_matrix_defines_person_hours(self):
+        """An explicit hours matrix sums to the total person-hours L, overriding the uniform-shift formula."""
         inp = base(hours_matrix=[[8, 8, 6], [7, 8, 9]], n_c=3, D_c=2)
         self.assertEqual(inp.person_hours(), 46)
 
@@ -234,6 +262,7 @@ class TestAccounting(unittest.TestCase):
         self.assertEqual(b3.household_requirement(), 2000)
 
     def test_runs_with_only_fixed_costs(self):
+        """A scenario with only a fixed (non-stochastic) cost item runs and produces the exact constant cost."""
         inp = dataclasses.replace(base(), costs=[CostItem("fixed", 1.0, fixed=300.0)], rho_spearman=None)
         r = run(inp, n_fixed=10_000)
         self.assertTrue(np.all(r.arrays["C_tot"] == 300.0))
@@ -243,11 +272,13 @@ class TestDependence(unittest.TestCase):
     """Required revision 9 / report 3.9: rank dependence, with an independent comparison."""
 
     def test_pearson_conversion(self):
+        """spearman_to_pearson() applies 2*sin(pi*rho/6) and keeps a perfect correlation at 1."""
         r = spearman_to_pearson(np.array([[1, 0.5], [0.5, 1]]))
         self.assertAlmostEqual(r[0, 1], 2 * np.sin(np.pi * 0.5 / 6))
         self.assertAlmostEqual(spearman_to_pearson(np.array([[1, 1.0], [1.0, 1]]))[0, 1], 1.0)
 
     def test_realized_rank_correlation_matches_target(self):
+        """The Gaussian copula produces a realized Spearman correlation close to the targeted rho."""
         inp = dataclasses.replace(base(), rho_spearman=[[1, 0.6], [0.6, 1]])
         rng = np.random.default_rng(5)
         chol = E2._copula_chol(inp)
@@ -256,11 +287,13 @@ class TestDependence(unittest.TestCase):
         self.assertAlmostEqual(rho, 0.6, delta=0.02)
 
     def test_independent_mode_has_no_dependence(self):
+        """dependence='independent' produces negligible rank correlation between cost rates."""
         inp = dataclasses.replace(base(), dependence="independent")
         c = sample_costs(inp, np.random.default_rng(6), 150_000, E2._copula_chol(inp))
         self.assertLess(abs(stats.spearmanr(c["fuel"], c["transport_hauling"]).statistic), 0.02)
 
     def test_dependence_changes_spread_not_marginals(self):
+        """Positive cost dependence widens the spread of total cost while leaving its mean essentially unchanged."""
         dep = run(base(), n_fixed=60_000, seed=9).arrays["C_tot"]
         ind = run(base(dependence="independent"), n_fixed=60_000, seed=9).arrays["C_tot"]
         self.assertAlmostEqual(dep.mean(), ind.mean(), delta=15)   # same marginal means
@@ -271,6 +304,7 @@ class TestConvergenceAndReproducibility(unittest.TestCase):
     """Required revision 10 / report 3.10."""
 
     def test_stops_when_every_mcse_within_tolerance(self):
+        """run() stops once N >= n_min and every probability's MCSE is within tolerance."""
         r = run(base())
         s = r.summary
         self.assertTrue(s["converged"])
@@ -279,6 +313,7 @@ class TestConvergenceAndReproducibility(unittest.TestCase):
             self.assertLessEqual(s[f"MCSE_{k}"], 0.005)
 
     def test_reports_non_convergence_honestly(self):
+        """A run capped below n_min, or with an unreachably tight tolerance, is reported as not converged."""
         r = run(base(), n_max=5_000)
         self.assertFalse(r.summary["converged"])
         self.assertTrue(any("NOT reached" in w for w in r.warnings))
@@ -286,6 +321,7 @@ class TestConvergenceAndReproducibility(unittest.TestCase):
         self.assertFalse(r2.summary["converged"])
 
     def test_same_seed_same_result_different_seed_differs(self):
+        """The same seed reproduces identical results and manifest hashes; a different seed differs."""
         a, b = run(base(), n_fixed=20_000, seed=7), run(base(), n_fixed=20_000, seed=7)
         c = run(base(), n_fixed=20_000, seed=8)
         np.testing.assert_array_equal(a.arrays["E"], b.arrays["E"])
@@ -293,6 +329,7 @@ class TestConvergenceAndReproducibility(unittest.TestCase):
         self.assertEqual(a.manifest["inputs_sha256"], b.manifest["inputs_sha256"])
 
     def test_staged_table_is_consistent(self):
+        """The staged-N stability table has the expected stages, valid probabilities, and shrinking MCSE."""
         r = run(base(), n_fixed=100_000)
         t = r.stage_table
         self.assertEqual(list(t["N"]), [1_000, 10_000, 50_000, 100_000])
@@ -312,6 +349,7 @@ class TestConvergenceAndReproducibility(unittest.TestCase):
         self.assertEqual(m["engine_sha256"], "unavailable")
 
     def test_manifest_records_provenance_and_config(self):
+        """The run manifest records the run config, input provenance, and code/environment versions."""
         m = run(base(), n_fixed=10_000, seed=11).manifest
         self.assertEqual(m["run_config"]["seed"], 11)
         self.assertIn("s_m", m["provenance"])
@@ -323,6 +361,7 @@ class TestOutputsAndLabels(unittest.TestCase):
     """Report 3.11-3.12: honest labels, exclusive bands, distributional output."""
 
     def test_expert_labels_and_no_poverty_trap_wording(self):
+        """Labels use the expert-report wording, avoid 'poverty', and the summary reports the required E statistics."""
         self.assertEqual(E2.LABELS["P_labor_return_below_wage"], "Probability of Labor Return Below Wage Benchmark")
         s = run(base(), n_fixed=10_000).summary
         for k in list(s) + list(E2.LABELS.values()):
@@ -332,6 +371,7 @@ class TestOutputsAndLabels(unittest.TestCase):
         self.assertLessEqual(s["E_expected_shortfall_5pct"], s["E_P5"])
 
     def test_risk_bands_are_mutually_exclusive_with_exact_edges(self):
+        """Risk bands partition [0, 1] exactly at their cut-offs, with no gaps or overlaps."""
         self.assertEqual(risk_band(0.67), "low")
         self.assertEqual(risk_band(0.6699), "moderate")
         self.assertEqual(risk_band(0.34), "moderate")
@@ -339,17 +379,20 @@ class TestOutputsAndLabels(unittest.TestCase):
         self.assertEqual({risk_band(p) for p in np.linspace(0, 1, 1001)}, {"low", "moderate", "high"})
 
     def test_rank_sensitivity_signs(self):
+        """Yield and price correlate positively with the return E; fuel cost correlates negatively."""
         s = run(base(), n_fixed=60_000).rank_sensitivity
         self.assertGreater(s["yield_Y"], 0)
         self.assertGreater(s["price_P"], 0)
         self.assertLess(s["cost_fuel"], 0)
 
     def test_scenario_table_p0_monotone(self):
+        """Raising the zero-yield probability p0 monotonically raises the negative-return probability."""
         t = scenario_table(base(), p0=[0.0, 0.1, 0.3], n_fixed=30_000)
         self.assertEqual(len(t), 3)
         self.assertTrue(t["P_negative_operating_return"].is_monotonic_increasing)
 
     def test_synthetic_profiles_run_and_differ(self):
+        """The synthetic demonstration profiles run and produce the expected directional differences."""
         out = {k: run(v, n_fixed=20_000).summary for k, v in synthetic_profiles().items()}
         self.assertLess(out["High-Cost"]["E_mean"], out["Baseline"]["E_mean"])
         self.assertGreater(out["Low-Purity"]["P_labor_return_below_wage"], 0)
@@ -364,6 +407,7 @@ class TestLegacyRegression(unittest.TestCase):
     """
 
     def test_kernel_reproduces_v1(self):
+        """accounting_kernel() reproduces V1.0's hourly return and required-yield outputs on identical draws."""
         H, T, Cf, W, Cfx, d, Cfu, al, eta = 8, .8, 90., 100., 1200., 1.1, 800., .02, .9
         v1 = legacy_v1.run_monte_carlo(H, T, Cf, W, Cfx, d, Cfu, al, 5.0, 20.0, 60.0, eta, 5000.0, 6000.0, 100_000)
         K = d * Cfx + (1 + al) * Cfu

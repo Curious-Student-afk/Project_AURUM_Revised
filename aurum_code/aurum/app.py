@@ -21,10 +21,12 @@ N_MAX_CHOICES = [50_000, 100_000, 200_000, 500_000]
 
 
 def _slug(text: str) -> str:
+    """Turn `text` into a widget-key-safe slug (alphanumerics kept, everything else becomes '_')."""
     return "".join(ch if ch.isalnum() else "_" for ch in text)
 
 
 def _show_fig(fig) -> None:
+    """Render a Matplotlib figure in Streamlit, then close it to release memory."""
     st.pyplot(fig)
     plt.close(fig)
 
@@ -38,16 +40,20 @@ def v2_form(preset: str) -> tuple:
     defaults = DL.preset_values(preset)
 
     def label(name: str, text: str) -> str:
+        """Widget label for `name`, suffixed with its current provenance tag."""
         cur = st.session_state.get(f"{ps}__{name}", defaults[name])
         return f"{text}  {DL.TAG_LABEL[DL.tag_for(name, cur, preset)]}"
 
     def num(name, text, help_text=None, **kw):
+        """Draw a tagged number_input widget bound to `name`."""
         return st.number_input(label(name, text), key=f"{ps}__{name}", help=help_text, **kw)
 
     def sld(name, text, help_text=None, **kw):
+        """Draw a tagged slider widget bound to `name`."""
         return st.slider(label(name, text), key=f"{ps}__{name}", help=help_text, **kw)
 
     def rad(name, text, options, help_text=None):
+        """Draw a tagged radio widget bound to `name`, defaulting to the preset's value."""
         return st.radio(label(name, text), options, index=options.index(defaults[name]), key=f"{ps}__{name}",
                         help=help_text)
 
@@ -322,6 +328,7 @@ def render_v2(state: dict) -> None:
 # Legacy V1.0
 # ------------------------------------------------------------------------------------------------
 def legacy_form() -> tuple:
+    """Draw the sidebar form for the legacy V1.0 per-person inputs. Returns (values dict, submitted flag)."""
     d = DL.LEGACY_DEFAULTS
     v = {}
     with st.sidebar.form(key="form_legacy"):
@@ -360,6 +367,7 @@ def legacy_form() -> tuple:
 
 
 def render_legacy(v: dict, out: dict) -> None:
+    """Render the legacy V1.0 results (deterministic reference, simulation, and known flaws)."""
     st.warning("Legacy V1.0, shown for comparison only. It has known flaws (listed below) and its outputs should not be "
                "reported as results.")
     c1, c2 = st.columns(2)
@@ -380,6 +388,7 @@ def render_legacy(v: dict, out: dict) -> None:
 
 # ------------------------------------------------------------------------------------------------
 def main() -> None:
+    """Streamlit app entry point: render the sidebar, dispatch to V2.2 or legacy V1.0, and show results."""
     st.set_page_config(page_title="Project AURUM", layout="wide")
     st.title("Project AURUM: Decision-Support Model")
     st.markdown("### Zero-aware stochastic risk analysis for small-scale gold mining")

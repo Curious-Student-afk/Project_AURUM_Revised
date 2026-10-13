@@ -130,22 +130,26 @@ class PERT:
 
     @property
     def degenerate(self) -> bool:
+        """True when min equals max, i.e. the distribution collapses to a constant."""
         return self.b == self.a
 
     @property
     def alpha(self) -> float:
+        """Beta shape parameter alpha implied by the PERT bounds and mode."""
         if self.degenerate:              # a == b: constant, shape is irrelevant (sample/ppf return a)
             return 1.0
         return 1.0 + 4.0 * (self.m - self.a) / (self.b - self.a)
 
     @property
     def beta(self) -> float:
+        """Beta shape parameter beta implied by the PERT bounds and mode."""
         if self.degenerate:
             return 1.0
         return 1.0 + 4.0 * (self.b - self.m) / (self.b - self.a)
 
     @property
     def mean(self) -> float:
+        """PERT mean: (a + 4m + b) / 6."""
         return (self.a + 4.0 * self.m + self.b) / 6.0
 
     def check(self, name: str, errs: List[str], strictly_positive: bool = False,
@@ -164,11 +168,13 @@ class PERT:
             errs.append(f"{name}: maximum must be <= {upper} (got {self.b}).")
 
     def sample(self, rng: np.random.Generator, size: int) -> np.ndarray:
+        """Draw `size` i.i.d. samples from this PERT distribution."""
         if self.degenerate:
             return np.full(size, float(self.a))
         return self.a + (self.b - self.a) * rng.beta(self.alpha, self.beta, size=size)
 
     def ppf(self, u: np.ndarray) -> np.ndarray:
+        """Inverse-CDF (quantile function) of this PERT distribution at probabilities `u`."""
         if self.degenerate:
             return np.full(np.shape(u), float(self.a))
         return self.a + (self.b - self.a) * stats.beta.ppf(u, self.alpha, self.beta)
@@ -187,6 +193,7 @@ class BatchTiming:
     hours_by_shifts: Dict[int, PERT]
 
     def check(self, errs: List[str]) -> None:
+        """Append validation errors for this batch timing's days, shift counts and hours."""
         for name, p in (("work_days", self.work_days), ("idle_days", self.idle_days)):
             if not isinstance(p, PERT):
                 errs.append(f"batch_timing.{name}: must be a PERT.")
@@ -234,6 +241,7 @@ class Jackpot:
     shape: float = 1.5
 
     def sample(self, rng: np.random.Generator, size: int) -> np.ndarray:
+        """Draw `size` i.i.d. truncated-Pareto jackpot magnitudes on [threshold, cap]."""
         u = rng.random(size)
         t, c, a = self.threshold, self.cap, self.shape
         tail = 1.0 - (t / c) ** a            # Pr(Pareto <= cap)
@@ -255,6 +263,7 @@ class ZeroYield:
     prior_b: float = 1.0
 
     def draw_p0(self, rng: np.random.Generator, size: int) -> np.ndarray:
+        """Draw `size` zero-yield probabilities: the fixed p0 if set, else the posterior Beta draw."""
         if self.p0 is not None:
             return np.full(size, float(self.p0))
         return rng.beta(self.prior_a + self.z, self.prior_b + self.n - self.z, size=size)
@@ -290,6 +299,7 @@ class EquipmentItem:
     rental_rate_per_shift: float = 0.0
 
     def cost_per_cycle(self, D_c: int) -> float:
+        """Depreciation (purchased) or rental cost (rented) for the cycle's D_c shifts."""
         if self.mode == "purchased":
             return (self.acquisition - self.salvage) / self.life_cycles * self.utilization
         if self.mode == "rented":
@@ -375,6 +385,7 @@ class Inputs:
 
     # derived helpers -----------------------------------------------------------------
     def person_hours(self) -> float:
+        """L: total person-hours for the fixed-timing cycle (raises for batch_timing inputs)."""
         if self.batch_timing is not None:
             raise InputError("Batch person-hours are sampled per draw; use result arrays.")
         if self.hours_matrix is not None:
@@ -400,6 +411,7 @@ class Inputs:
                 sum(eq.miner_share * eq.cost_per_cycle(self.D_c) for eq in purchased))
 
     def all_cost_items(self) -> List[CostItem]:
+        """All cost items, including equipment depreciation/rental cast as CostItems."""
         items = list(self.costs)
         for eq in self.equipment:
             if self.batch_timing is not None and eq.mode == "rented":
@@ -411,6 +423,7 @@ class Inputs:
         return items
 
     def stochastic_cost_items(self) -> List[CostItem]:
+        """All cost items drawn from a PERT distribution (excludes fixed-amount items)."""
         return [c for c in self.all_cost_items() if c.pert is not None]
 
 
@@ -647,6 +660,7 @@ def validate(inp: Inputs) -> List[str]:
 # Sampling
 # ----------------------------------------------------------------------------------------
 def _copula_chol(inp: Inputs) -> Optional[np.ndarray]:
+    """Cholesky factor of the Gaussian copula's correlation matrix, or None if not needed."""
     sto = inp.stochastic_cost_items()
     if inp.dependence != "copula" or len(sto) < 2:
         return None
@@ -654,6 +668,11 @@ def _copula_chol(inp: Inputs) -> Optional[np.ndarray]:
 
 
 def sample_timing(inp: Inputs, rng: np.random.Generator, size: int) -> Dict[str, np.ndarray]:
+    """Draw per-cycle timing arrays (days, shifts, hours, L, B_HH) for `size` draws.
+
+    Falls back to fixed-timing constants when batch_timing is unset; otherwise simulates
+    daily work/idle days, shift counts and hours per the batch_timing schedule.
+    """
     if inp.batch_timing is None:
         return {"calendar_days_per_cycle": np.full(size, inp.calendar_days()),
                 "total_shifts": np.full(size, inp.D_c, dtype=int),
@@ -679,6 +698,7 @@ def sample_timing(inp: Inputs, rng: np.random.Generator, size: int) -> Dict[str,
 
 
 def expense_exposure(basis: str, timing: Dict[str, np.ndarray]):
+    """Exposure array (or scalar 1.0 for per_batch) that a cost `basis` scales against."""
     keys = {"per_shift": "total_shifts", "per_operating_hour": "operating_hours",
             "per_working_day": "working_days", "per_calendar_day": "calendar_days_per_cycle"}
     return 1.0 if basis == "per_batch" else timing[keys[basis]]
@@ -707,6 +727,7 @@ def sample_costs(inp: Inputs, rng: np.random.Generator, size: int,
 
 def sample_batch(inp: Inputs, rng: np.random.Generator, size: int,
                  chol: Optional[np.ndarray], timing_rng: Optional[np.random.Generator] = None) -> Dict[str, np.ndarray]:
+    """Draw one chunk of `size` simulated batches: yield, price/purity, costs and timing."""
     p0 = inp.zero.draw_p0(rng, size)
     positive = rng.random(size) >= p0                    # hurdle: True = productive cycle
     is_jack = rng.random(size) < inp.pi_J                # given productive
@@ -1000,6 +1021,7 @@ def run(inp: Inputs, *, seed: int = 42, batch_size: int = 5_000, n_min: int = 10
 # Run manifest (expert report 3.10: preserve code version, input version, configuration)
 # ----------------------------------------------------------------------------------------
 def _jsonable(o):
+    """Recursively convert dataclasses and NumPy scalars into plain JSON-serialisable types."""
     if dataclasses.is_dataclass(o):
         return {k: _jsonable(v) for k, v in dataclasses.asdict(o).items()}
     if isinstance(o, dict):

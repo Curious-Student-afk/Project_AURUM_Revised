@@ -7,6 +7,7 @@ from engine_v2 import BatchTiming, CostItem, Inputs, Jackpot, PERT, ZeroYield
 
 
 def default_timing() -> BatchTiming:
+    """Default synthetic batch-timing schedule used by batch_synthetic()."""
     return BatchTiming(PERT(2, 3, 5), PERT(0, 1, 3), (6, 3, 1),
                        {1: PERT(6, 8, 10), 2: PERT(3, 4, 6), 3: PERT(2, 3, 4)})
 
@@ -26,6 +27,7 @@ def fixed_synthetic(mode_frac: float = 1 / 3) -> Inputs:
 
 
 def batch_synthetic() -> Inputs:
+    """Synthetic batch-timing example built on fixed_synthetic(), with exposure-based costs."""
     inp = dataclasses.replace(fixed_synthetic(), batch_timing=default_timing(), calendar_days_per_cycle=None,
         costs=[CostItem('fuel', pert=PERT(50, 75, 100), basis='per_operating_hour'),
                CostItem('milling', pert=PERT(500, 750, 1000)),
@@ -38,6 +40,7 @@ def batch_synthetic() -> Inputs:
 
 
 def _scale_costs(inp: Inputs, factor: float) -> Inputs:
+    """Return a copy of `inp` with every cost item's fixed amount or PERT scaled by `factor`."""
     costs = [dataclasses.replace(c, fixed=c.fixed * factor) if c.fixed is not None else
              dataclasses.replace(c, pert=PERT(c.pert.a * factor, c.pert.m * factor, c.pert.b * factor))
              for c in inp.costs]
@@ -45,6 +48,7 @@ def _scale_costs(inp: Inputs, factor: float) -> Inputs:
 
 
 def synthetic_profiles() -> Dict[str, Inputs]:
+    """Named synthetic demonstration profiles (Baseline, High-Cost, Low-Purity)."""
     base = batch_synthetic()
     return {'Baseline': base, 'High-Cost': _scale_costs(base, 1.5),
             'Low-Purity': dataclasses.replace(base, price_basis='reference', purity=PERT(.75, .85, .95))}

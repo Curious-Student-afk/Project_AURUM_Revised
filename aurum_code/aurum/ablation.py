@@ -80,6 +80,7 @@ _V1_CACHE: Dict[int, dict] = {}
 
 
 def v1_draws(N: int) -> dict:
+    """Return V1.0's Monte Carlo draws for `N` iterations, cached per N."""
     if N not in _V1_CACHE:
         b = BENCH
         _V1_CACHE[N] = legacy_v1.run_monte_carlo(
@@ -102,6 +103,7 @@ def _lognormal_base(rng, n):
 # Simulator with one switch per fix
 # --------------------------------------------------------------------------------------
 def simulate(cfg: Cfg, N: int, seed: int = 42, A: Optional[dict] = None) -> Dict[str, np.ndarray]:
+    """Simulate `N` cycles under configuration `cfg`, switching each fix on/off per its flags."""
     A = {**ASSUME, **(A or {})}
     b = BENCH
     rs = {n: np.random.default_rng(s) for n, s in zip(STREAMS, np.random.SeedSequence(seed).spawn(len(STREAMS)))}
@@ -159,6 +161,7 @@ def simulate(cfg: Cfg, N: int, seed: int = 42, A: Optional[dict] = None) -> Dict
 
 
 def metrics(res: Dict[str, np.ndarray]) -> dict:
+    """Summarise a simulate() result into headline probabilities and E/Y statistics."""
     E, Pi = res["E"], res["Pi"]
     n = len(E)
     k, kn = int(np.count_nonzero(E < BENCH["W"])), int(np.count_nonzero(Pi < 0))
@@ -168,6 +171,7 @@ def metrics(res: Dict[str, np.ndarray]) -> dict:
 
 
 def run_cfg(cfg: Cfg, N: int, seed: int, A: Optional[dict] = None) -> dict:
+    """Simulate configuration `cfg` and return its label plus summary metrics."""
     return {"label": cfg.label, **metrics(simulate(cfg, N, seed, A))}
 
 
@@ -209,6 +213,7 @@ CHAIN_ORDER = ["labor", "eta", "yield", "price", "zero", "jackpot", "costs", "de
 
 
 def forward_chain(N, seed, A=None) -> pd.DataFrame:
+    """Build the S0..S8 cumulative forward-chain table, adding one fix at a time from V1.0."""
     fx = {f[0]: f for f in FIXES}
     cfg, rows, prev, first = V1, [], None, None
     r = {"step": "S0", "change": "V1.0 synthetic reference (frozen code, benchmark inputs)", **run_cfg(cfg, N, seed, A)}
@@ -226,6 +231,7 @@ def forward_chain(N, seed, A=None) -> pd.DataFrame:
 
 
 def solo(N, seed, A=None) -> pd.DataFrame:
+    """Build the order-free table of each fix applied alone to V1.0."""
     base = run_cfg(V1, N, seed, A)
     rows = []
     for key, name, desc, on, _ in FIXES:
@@ -237,6 +243,7 @@ def solo(N, seed, A=None) -> pd.DataFrame:
 
 
 def leave_one_out(N, seed, A=None) -> pd.DataFrame:
+    """Build the order-free table of each fix reverted/removed from the full model, ranked by effect size."""
     full = run_cfg(FULL, N, seed, A)
     rows = []
     for key, name, desc, _, off in FIXES:
@@ -252,11 +259,13 @@ def leave_one_out(N, seed, A=None) -> pd.DataFrame:
 
 
 def seed_check(N, seeds) -> pd.DataFrame:
+    """Run the full model under each seed in `seeds` to measure seed-to-seed noise."""
     rows = [{"seed": s, **run_cfg(FULL, N, s)} for s in seeds]
     return pd.DataFrame(rows)
 
 
 def sensitivity(N, seed) -> pd.DataFrame:
+    """Run the full model over a grid of alternative values for each ASSUMED parameter."""
     grid = [("p0", [0.0, 0.05, 0.10, 0.20, 0.30]), ("pi_J", [0.0, 0.005, 0.01, 0.02, 0.05]),
             ("mode_frac", sorted({0.25, 0.40, 0.60, round(mode_frac_matching_v1_mean(), 3)})), ("n_c", [3, 4, 5, 6, 8]), ("rho", [0.0, 0.3, 0.5, 0.8]),
             ("cost_spread", [(0.9, 1.1), (0.8, 1.2), (0.7, 1.5)])]
@@ -302,6 +311,7 @@ def v1_literal_diagnostic(N) -> dict:
 # Figures and report
 # --------------------------------------------------------------------------------------
 def plot_forward(df: pd.DataFrame, path: str) -> None:
+    """Save the forward-chain error-bar plot to `path`."""
     fig, ax = plt.subplots(figsize=(10, 5.2))
     x = np.arange(len(df))
     y = 100 * df["p_wage_below"].to_numpy()
@@ -325,6 +335,7 @@ def plot_forward(df: pd.DataFrame, path: str) -> None:
 
 
 def plot_loo(df: pd.DataFrame, path: str) -> None:
+    """Save the leave-one-out horizontal bar plot to `path`."""
     d = df.iloc[::-1]
     fig, ax = plt.subplots(figsize=(9, 4.8))
     colors = ["#c0392b" if v > 0 else "#2e7d32" for v in d["d_full_pp"]]
@@ -340,6 +351,7 @@ def plot_loo(df: pd.DataFrame, path: str) -> None:
 
 
 def md_table(df: pd.DataFrame, fmt: Dict[str, str]) -> str:
+    """Render `df` as a GitHub-flavoured Markdown table, formatting columns per `fmt`."""
     cols = list(df.columns)
     lines = ["| " + " | ".join(cols) + " |", "|" + "|".join(["---"] * len(cols)) + "|"]
     for _, row in df.iterrows():
@@ -357,6 +369,7 @@ def md_table(df: pd.DataFrame, fmt: Dict[str, str]) -> str:
 
 
 def build_report(fwd, sol, loo, seeds, sens, diag, N, seed) -> str:
+    """Assemble the full Markdown ablation report from all computed tables."""
     pct = lambda s: 100 * s
     noise = 2 * pct(seeds["p_wage_below"].std(ddof=1))
     f = fwd.copy()
@@ -383,6 +396,7 @@ def build_report(fwd, sol, loo, seeds, sens, diag, N, seed) -> str:
     sn.columns = ["Parameter varied", "Value", "Primary", "P(E<W) %", "E median"]
     mm = mode_frac_matching_v1_mean()
     def _prov(k):
+        """Provenance label for parameter `k`, matching slash-joined PROVENANCE keys by prefix."""
         if k in PROVENANCE:
             return PROVENANCE[k]
         return next((p for pk, p in PROVENANCE.items() if "/" in pk and k.startswith(pk.split("_")[0] + "_")), "")
@@ -448,6 +462,7 @@ Synthetic V1.0 benchmark: {json.dumps(BENCH)}
 
 # --------------------------------------------------------------------------------------
 def main(argv=None) -> None:
+    """CLI entry point: run all four ablation views and write CSVs, plots, report and manifest."""
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[1])
     ap.add_argument("--n", type=int, default=500_000, help="draws per configuration")
     ap.add_argument("--seed", type=int, default=42)
