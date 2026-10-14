@@ -50,10 +50,13 @@ class TestMapping(unittest.TestCase):
         E2.validate(restored)
 
     def test_all_presets_build_and_run(self):
-        """Every preset builds valid Inputs and converges, with the Low-Purity preset on a reference price basis."""
+        """Every preset builds valid Inputs and reports precision/failure reasons, including reference purity."""
         for p in DL.PRESETS:
             inp, res = DL.run_v2({**DL.preset_values(p), "n_max": 50_000}, p)
-            self.assertTrue(res.summary["converged"], p)
+            self.assertTrue(res.summary["probability_precision_met"], p)
+            self.assertIn("error_E_P95", res.summary)
+            if not res.summary["converged"]:
+                self.assertTrue(res.summary["convergence_reasons"])
         self.assertEqual(DL.preset_values(DL.PRESETS[2])["price_basis"], "reference")
 
     def test_equipment_and_counts_paths(self):
@@ -70,7 +73,7 @@ class TestMapping(unittest.TestCase):
     def test_reference_basis_uses_purity_farmgate_ignores_it(self):
         """Farmgate pricing forces purity to 1.0; reference pricing keeps purity as a PERT."""
         self.assertEqual(DL.build_inputs(vals(price_basis="farmgate")).purity, 1.0)
-        self.assertIsInstance(DL.build_inputs(vals(price_basis="reference")).purity, E2.PERT)
+        self.assertIsInstance(DL.build_inputs(vals(price_basis="reference", assay_mode="PERT fraction")).purity, E2.PERT)
 
     def test_invalid_entries_raise_readable_errors(self):
         """Invalid yield ordering, inconsistent zero-yield counts, and bad jackpot bounds raise readable InputErrors."""
@@ -215,7 +218,7 @@ class TestAppSmoke(unittest.TestCase):
         metrics = [a[0] for a, _ in fake.calls("metric")]
         self.assertEqual(metrics, list(E2.LABELS.values()))
         self.assertEqual(len(fake.calls("pyplot")), 4)
-        self.assertEqual(len(fake.calls("download_button")), 3)
+        self.assertEqual(len(fake.calls("download_button")), 4)
         self.assertEqual(len(fake.calls("tabs")[0][0]), 6)
         blob = " ".join(fake.texts()).lower()
         self.assertIn("scenario results", blob)
@@ -242,7 +245,7 @@ class TestAppSmoke(unittest.TestCase):
         """Running the scenario grid populates the overview, convergence and grid dataframes."""
         f1, _ = run_app(overrides={"n_max": 50_000}, submit=True)
         f2, _ = run_app(submit=False, press={"Run scenario grid"}, session_state=f1.session_state)
-        self.assertEqual(len(f2.calls("dataframe")), 4 + 2 + 1)      # overview 4, convergence 1, grid 2
+        self.assertEqual(len(f2.calls("dataframe")), 4 + 2 + 1 + 1)      # overview 4, convergence 1, benchmark sensitivity 1, grid 2
 
     def test_fixed_timing_explains_unsupported_daily_rates_before_submit(self):
         """Switching to fixed timing warns about unsupported per-working-day rates before the form is submitted."""

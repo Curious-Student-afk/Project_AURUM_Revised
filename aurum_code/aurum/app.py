@@ -16,7 +16,7 @@ import streamlit as st
 import dashboard_logic as DL
 import engine_v2 as E2
 
-VERSIONS = ["V2.2 (current)", "V1.0 (legacy, frozen - comparison only)"]
+VERSIONS = ["V2.3 (current)", "V1.0 (legacy, frozen - comparison only)"]
 N_MAX_CHOICES = [50_000, 100_000, 200_000, 500_000]
 
 
@@ -32,7 +32,7 @@ def _show_fig(fig) -> None:
 
 
 # ------------------------------------------------------------------------------------------------
-# V2.0 sidebar form
+# V2.3 sidebar form
 # ------------------------------------------------------------------------------------------------
 def v2_form(preset: str) -> tuple:
     """Draw the input form. Returns (values dict, submitted flag)."""
@@ -63,9 +63,13 @@ def v2_form(preset: str) -> tuple:
                                   ("price_basis", "Gold price basis", ["farmgate", "reference"]),
                                   ("share_preset", "Miner/financier split", ["Custom", "50/50", "60/40", "65/35"])):
         v[name] = st.sidebar.radio(label(name, title), options, index=options.index(d[name]), key=f"{ps}__{name}")
+    assay_options = ["PERT fraction", "measured value"] if v["price_basis"] == "reference" else ["unknown", "PERT fraction", "measured value"]
+    assay_default = d["assay_mode"] if d["assay_mode"] in assay_options else assay_options[0]
+    v["assay_mode"] = st.sidebar.radio("Physical assay input", assay_options, index=assay_options.index(assay_default),
+                                      key=f"{ps}_{v['price_basis']}__assay_mode")
     with st.sidebar.form(key=f"form_{ps}"):
         st.markdown("**1. Batch timing and labour**")
-        v["n_c"] = num("n_c", "Registered crew size", "Every registered worker attends every scheduled shift.",
+        v["n_c"] = num("n_c", "Active crew size", "Every active contributor attends every scheduled shift. Partial attendance and changing crew membership are unsupported in batch mode.",
                        min_value=1, max_value=100, value=int(d["n_c"]), step=1)
         if v["timing_mode"] == "batch":
             st.caption("Working days: discretized Beta-PERT, rounded to the nearest whole day. Idle days: continuous Beta-PERT.")
@@ -91,11 +95,11 @@ def v2_form(preset: str) -> tuple:
             v["h"] = num("h", "Fixed hours per worker per shift", min_value=.5, max_value=24., value=float(d["h"]), step=.25)
 
         st.markdown("**2. Stakeholder accounting**")
-        v["s_m"] = num("s_m", "Miner-group revenue share s_m", "Group share of the revenue base (1 minus the non-miner share).",
+        v["s_m"] = num("s_m", "Miner-group revenue share s_m", "Group share of the revenue base (1 minus the aggregate non-miner share).",
                        min_value=0.01, max_value=1.0, value=float(d["s_m"]), step=0.01, format="%.4f", disabled=v["share_preset"] != "Custom")
         v["tribute_base"] = rad("tribute_base", "Share applies to", ["gross", "net"],
                                 "gross: miners pay their cost share out of their revenue share. "
-                                "net: costs are deducted first, then the share is applied.")
+                                "net: all operation costs are deducted first, then the share is applied; individual cost shares do not alter this contract.")
 
         st.markdown("**3. Gold yield** (group total, recovered grams per batch)")
         v["ya"] = num("ya", "Typical minimum yield a (g)", "Minimum ordinary batch yield.",
@@ -121,18 +125,29 @@ def v2_form(preset: str) -> tuple:
 
         st.markdown("**4. Price and purity** (handled exactly once)")
         st.caption("Farmgate pricing values recovered gold directly. Reference pricing applies purity to obtain fine gold mass.")
+        v["price_input"] = rad("price_input", "Price entered as", ["direct", "sale"])
+        st.caption("Sale conversion uses total PHP paid divided by recovered grams sold, and requires farmgate pricing.")
+        v["sale_proceeds"] = num("sale_proceeds", "Sale proceeds (PHP)", min_value=.01, value=float(d["sale_proceeds"]), step=1.)
+        v["sale_mass"] = num("sale_mass", "Recovered mass sold (g)", min_value=.001, value=float(d["sale_mass"]), step=.1)
         v["p_min"] = num("p_min", "Price minimum (PHP/g)", None, min_value=1.0, max_value=1_000_000.0,
                          value=float(d["p_min"]), step=50.0, format="%.2f")
         v["p_mode"] = num("p_mode", "Price most likely (PHP/g)", "Most likely price under this scenario.",
                           min_value=1.0, max_value=1_000_000.0, value=float(d["p_mode"]), step=50.0, format="%.2f")
         v["p_max"] = num("p_max", "Price maximum (PHP/g)", None, min_value=1.0, max_value=1_000_000.0,
                          value=float(d["p_max"]), step=50.0, format="%.2f")
-        v["q_min"] = num("q_min", "Purity minimum q (used only on a reference basis)", None, min_value=0.01,
-                         max_value=1.0, value=float(d["q_min"]), step=0.01, format="%.3f", disabled=v["price_basis"] == "farmgate")
-        v["q_mode"] = num("q_mode", "Purity most likely q", None, min_value=0.01, max_value=1.0,
-                          value=float(d["q_mode"]), step=0.01, format="%.3f", disabled=v["price_basis"] == "farmgate")
-        v["q_max"] = num("q_max", "Purity maximum q", None, min_value=0.01, max_value=1.0,
-                         value=float(d["q_max"]), step=0.01, format="%.3f", disabled=v["price_basis"] == "farmgate")
+        v["q_min"] = num("q_min", "Physical purity minimum (fraction)", None, min_value=0.01,
+                         max_value=1.0, value=float(d["q_min"]), step=0.01, format="%.3f", disabled=v["assay_mode"] != "PERT fraction")
+        v["q_mode"] = num("q_mode", "Physical purity most likely (fraction)", None, min_value=0.01, max_value=1.0,
+                          value=float(d["q_mode"]), step=0.01, format="%.3f", disabled=v["assay_mode"] != "PERT fraction")
+        v["q_max"] = num("q_max", "Physical purity maximum (fraction)", None, min_value=0.01, max_value=1.0,
+                         value=float(d["q_max"]), step=0.01, format="%.3f", disabled=v["assay_mode"] != "PERT fraction")
+
+        v["assay_unit"] = rad("assay_unit", "Measured assay unit", ["fraction", "percent", "karat"])
+        v["assay_value"] = num("assay_value", "Measured assay value", min_value=.001, max_value=100.,
+                               value=float(d["assay_value"]), step=.1, disabled=v["assay_mode"] != "measured value")
+        v["measurement_source"] = st.text_input("Measurement source", value=str(d["measurement_source"]), key=f"{ps}__measurement_source")
+        v["measurement_date"] = st.text_input("Measurement date (YYYY-MM-DD, optional)", value=str(d["measurement_date"]), key=f"{ps}__measurement_date")
+        st.caption("Unknown farmgate assay stays blank in corrected exports. Physical assay never changes farmgate valuation.")
 
         st.markdown("**5. Expense rates for the whole operation**")
         st.caption("Food is additional worksite consumption excluded from household needs. Operating hours sum scheduled shift durations, without multiplying by crew size.")
@@ -140,6 +155,11 @@ def v2_form(preset: str) -> tuple:
                               max_value=10_000_000., value=float(d["fixed_cost"]), step=10.)
         v["fixed_share"] = num("fixed_share", "Miner fraction of overhead", min_value=0., max_value=1.,
                                value=float(d["fixed_share"]), step=.5)
+        v["fixed_components"] = st.text_input("Overhead component identifiers (comma separated)", value=str(d["fixed_components"]),
+                                               key=f"{ps}__fixed_components", help="Required for nonzero overhead; exclude fuel, milling and other separately listed components.")
+        v["fuel_input"] = rad("fuel_input", "Fuel entered as", ["direct", "liters × PHP/liter"])
+        v["fuel_liters"] = num("fuel_liters", "Fuel liters per selected expense basis", min_value=0., value=float(d["fuel_liters"]), step=1.)
+        v["fuel_unit_price"] = num("fuel_unit_price", "Fuel unit price (PHP/liter)", min_value=.01, value=float(d["fuel_unit_price"]), step=1.)
         for prefix, name in DL.COST_FIELDS.items():
             key = f"{prefix}_basis"
             options = list(E2.COST_BASES)
@@ -194,13 +214,13 @@ def v2_form(preset: str) -> tuple:
                          min_value=0.01, max_value=5000.0, value=float(d["W_opp"]), step=1.0, format="%.2f")
         v["W_src"] = st.text_input("Wage benchmark source", value=str(d["W_src"]), key=f"{ps}__W_src")
         v["W_date"] = st.text_input("Wage benchmark effective date", value=str(d["W_date"]), key=f"{ps}__W_date")
-        v["hh_need"] = num("hh_need", "Household consumption W_daily (PHP/household/calendar day)", "Excludes additional worksite food. Batch mode represents one household per worker.",
+        v["hh_need"] = num("hh_need", "Household consumption W_daily (PHP/household/calendar day)", "Excludes additional worksite food. Household count and outside income are independent of active crew size.",
                            min_value=0.0, max_value=1_000_000.0, value=float(d["hh_need"]), step=25.0, format="%.2f")
-        if v["timing_mode"] == "fixed":
-            v["n_hh"] = num("n_hh", "Households supported (0 = one per crew member)", None, min_value=0, max_value=200,
-                            value=int(d["n_hh"]), step=1)
-            v["nonmining"] = num("nonmining", "Non-mining income (PHP/household/day)", None, min_value=0.0,
-                                 max_value=1_000_000.0, value=float(d["nonmining"]), step=25.0, format="%.2f")
+        v["households_mode"] = rad("households_mode", "Household count", ["one per worker", "explicit"])
+        v["n_hh"] = num("n_hh", "Households supported (explicit zero is allowed)", min_value=0, max_value=200,
+                        value=int(d["n_hh"]), step=1)
+        v["nonmining"] = num("nonmining", "Non-mining income (PHP/household/calendar day)", min_value=0.,
+                             max_value=1_000_000., value=float(d["nonmining"]), step=25.)
 
         st.markdown("**8. Simulation precision**")
         v["seed"] = st.number_input("Random seed", key=f"{ps}__seed", help="Same seed + same inputs = same results.",
@@ -208,16 +228,21 @@ def v2_form(preset: str) -> tuple:
         v["tol"] = st.number_input("MCSE tolerance for every probability", key=f"{ps}__tol", min_value=0.001,
                                    max_value=0.05, value=float(d["tol"]), step=0.001, format="%.3f")
         v["n_max"] = st.selectbox("Maximum cycles N", N_MAX_CHOICES, index=N_MAX_CHOICES.index(int(d["n_max"])),
-                                  key=f"{ps}__n_max", help="The run stops earlier once every probability's MCSE is within tolerance.")
+                                  key=f"{ps}__n_max", help="The run stops when probability and return precision, stability and mixture support pass.")
+        v["return_abs_tol"] = num("return_abs_tol", "Return error tolerance (PHP/person-hour)", min_value=.01,
+                                  max_value=1000., value=float(d["return_abs_tol"]), step=.5)
+        v["return_rel_tol"] = num("return_rel_tol", "Return relative error tolerance (fraction)", min_value=0.,
+                                  max_value=1., value=float(d["return_rel_tol"]), step=.005)
+        st.caption("Use the larger absolute/relative tolerance. Two precision checks, stable returns and mixture support are required.")
         submitted = st.form_submit_button("Run Project AURUM model")
     return v, submitted
 
 
 # ------------------------------------------------------------------------------------------------
-# V2.0 results
+# V2.3 results
 # ------------------------------------------------------------------------------------------------
 def render_v2(state: dict) -> None:
-    """Render the V2.0 results tabs (overview, distributions, convergence, scenario, export, about)."""
+    """Render the V2.3 results tabs (overview, distributions, convergence, scenario, export, about)."""
     inp, res, tags = state["inp"], state["res"], state["tags"]
     s = res.summary
     assumed = DL.assumed_inputs(tags)
@@ -275,6 +300,10 @@ def render_v2(state: dict) -> None:
 
     with tab_conv:
         st.subheader("Stability as N grows")
+        st.caption(f"Probability precision: {s['probability_precision_met']}; return precision: {s['return_precision_met']}; full convergence: {s['converged']}")
+        st.caption("Numerical bounds estimate sampling error. They are not model-uncertainty or predictive intervals.")
+        if "p0_posterior_lower_95" in s:
+            st.info(f"Zero-probability posterior 95% interval: {s['p0_posterior_lower_95']:.1%}–{s['p0_posterior_upper_95']:.1%}. This is parameter uncertainty, separate from MCSE.")
         st.dataframe(res.stage_table.round(4))
         _show_fig(DL.fig_stability(res.stage_table))
         st.subheader("Rank-based sensitivity")
@@ -284,6 +313,9 @@ def render_v2(state: dict) -> None:
                    "strength of association; Sobol variance shares are future work.")
 
     with tab_scen:
+        st.subheader("Wage and illustrative cutoff sensitivity (same simulated draws)")
+        st.dataframe(DL.benchmark_sensitivity(res, inp))
+        st.caption("These comparisons do not establish policy validity for the wage or cutoffs.")
         st.subheader("Spread over the assumed parameters")
         st.write("Re-runs the model (20,000 cycles each) over assumed values of the zero-yield probability and the yield "
                  "mode, and over crew size. Use the range, not one number.")
@@ -312,10 +344,12 @@ def render_v2(state: dict) -> None:
                  f"inputs hash {res.manifest['inputs_sha256'][:12]}...")
         st.download_button("Download run manifest (JSON)", DL.export_manifest(res, extras), file_name="aurum_run_manifest.json",
                            mime="application/json")
-        st.download_button("Download first 5,000 cycles (CSV)", DL.export_csv(res, 5_000),
+        st.download_button("Download first 5,000 cycles (CSV schema 2)", DL.export_csv(res, 5_000),
                            file_name="aurum_cycles_5000.csv", mime="text/csv")
-        st.download_button("Download first 50,000 cycles (CSV)", DL.export_csv(res, 50_000),
+        st.download_button("Download first 50,000 cycles (CSV schema 2)", DL.export_csv(res, 50_000),
                            file_name="aurum_cycles_50000.csv", mime="text/csv")
+        st.download_button("Download legacy CSV schema 1 (purity_q means valuation multiplier)", DL.export_csv(res, 5_000, schema_version=1),
+                           file_name="aurum_cycles_legacy_schema1.csv", mime="text/csv")
         with st.expander("Manifest preview"):
             st.code(json.dumps({k: res.manifest[k] for k in ("engine_version", "engine_sha256", "inputs_sha256", "run_config")},
                                indent=2), language="json")
@@ -388,7 +422,7 @@ def render_legacy(v: dict, out: dict) -> None:
 
 # ------------------------------------------------------------------------------------------------
 def main() -> None:
-    """Streamlit app entry point: render the sidebar, dispatch to V2.2 or legacy V1.0, and show results."""
+    """Streamlit app entry point: render the sidebar, dispatch to V2.3 or legacy V1.0, and show results."""
     st.set_page_config(page_title="Project AURUM", layout="wide")
     st.title("Project AURUM: Decision-Support Model")
     st.markdown("### Zero-aware stochastic risk analysis for small-scale gold mining")

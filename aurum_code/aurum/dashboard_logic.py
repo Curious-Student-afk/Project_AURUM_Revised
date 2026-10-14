@@ -26,9 +26,10 @@ from scipy import stats  # noqa: E402
 
 import engine_v2 as E2  # noqa: E402
 import legacy_v1  # noqa: E402
+import normalization as N  # noqa: E402
 from scenarios import synthetic_profiles, default_timing, legacy_synthetic_values  # noqa: E402
 
-DASHBOARD_VERSION = "2.2.0-draft"
+DASHBOARD_VERSION = "2.3.0-draft"
 
 # --------------------------------------------------------------------------------------
 # Provenance tags
@@ -65,7 +66,8 @@ def values_from_inputs(inp: E2.Inputs) -> Dict[str, object]:
     price = inp.price if isinstance(inp.price, E2.PERT) else E2.PERT(inp.price, inp.price, inp.price)
     pur = inp.purity if isinstance(inp.purity, E2.PERT) else E2.PERT(inp.purity, inp.purity, inp.purity)
     if inp.price_basis == "farmgate":
-        pur = E2.PERT(.75, .85, .95)
+        assay = inp.physical_purity
+        pur = assay if isinstance(assay, E2.PERT) else E2.PERT(assay or 1., assay or 1., assay or 1.)
     v = {
         "timing_mode": "batch" if inp.batch_timing else "fixed",
         "calendar_days": 1. if inp.batch_timing else inp.calendar_days(),
@@ -79,13 +81,21 @@ def values_from_inputs(inp: E2.Inputs) -> Dict[str, object]:
         "n_obs": inp.zero.n if inp.zero.n is not None else 10,
         "pi_J": inp.pi_J, "jack_thr": float(j.threshold), "jack_cap": float(j.cap), "jack_shape": float(j.shape),
         "price_basis": inp.price_basis, "p_min": float(price.a), "p_mode": float(price.m), "p_max": float(price.b),
+        "assay_mode": "unknown" if inp.price_basis == "farmgate" and inp.physical_purity is None else "PERT fraction",
+        "assay_value": float(pur.m), "assay_unit": "fraction",
+        "price_input": "direct", "sale_proceeds": 1., "sale_mass": 1.,
+        "fuel_input": "direct", "fuel_liters": 0., "fuel_unit_price": 1.,
+        "measurement_source": str(inp.metadata.get("source", "")),
+        "measurement_date": str(inp.metadata.get("date", "")),
+        "fixed_components": "", "households_mode": "one per worker" if inp.n_households is None else "explicit",
+        "return_abs_tol": 1., "return_rel_tol": .01,
         "q_min": float(pur.a), "q_mode": float(pur.m), "q_max": float(pur.b),
         "fixed_cost": 0., "fixed_share": 1., "dependence": inp.dependence,
         "reserve_mode": inp.reserve_mode, "reserve_location": inp.reserve_location or "choose",
         "reserve_priority": inp.reserve_priority or "choose", "reserve_custom": inp.reserve_custom_per_cycle,
         "eq_mode": "none", "eq_acq": 0., "eq_salv": 0., "eq_life": 1000., "eq_util": 1., "eq_rent": 0., "eq_share": 1.,
         "W_opp": inp.W_opp, "W_src": inp.W_opp_source, "W_date": inp.W_opp_date,
-        "hh_need": inp.hh_need_per_household_day, "n_hh": inp.n_households or 0,
+        "hh_need": inp.hh_need_per_household_day, "n_hh": inp.n_c if inp.n_households is None else inp.n_households,
         "nonmining": inp.nonmining_income_per_household_day, "seed": 42, "tol": .005, "n_max": 200_000,
     }
     t = inp.batch_timing or default_timing()
@@ -108,7 +118,8 @@ def values_from_inputs(inp: E2.Inputs) -> Dict[str, object]:
         v[f"{prefix}_share"], v[f"{prefix}_basis"] = float(c.miner_share), c.basis
     if "fixed_operating" in costs:
         c = costs["fixed_operating"]
-        v.update(fixed_cost=float(c.fixed), fixed_share=float(c.miner_share))
+        v.update(fixed_cost=float(c.fixed), fixed_share=float(c.miner_share),
+                 fixed_components=", ".join(c.components or [c.name]))
     stochastic_names = [c.name for c in inp.stochastic_cost_items()]
     for i, j, key in correlation_keys():
         names = list(COST_FIELDS.values())
@@ -155,9 +166,43 @@ def effective_tags(values: Dict[str, object], preset: str) -> Dict[str, str]:
 
 def build_inputs(v: Dict[str, object], preset: Optional[str] = None) -> E2.Inputs:
     """Flat UI values -> engine Inputs (validation happens in engine_v2.validate / run)."""
+    v = dict(v)
+    metadata = {"source": v.get("measurement_source", ""), "date": v.get("measurement_date", "")}
+    if metadata["date"]:
+        from datetime import date
+        try:
+            parsed_date = date.fromisoformat(metadata["date"])
+            if parsed_date.isoformat() != metadata["date"]:
+                raise ValueError("Measurement date is not in canonical format.")
+        except (TypeError, ValueError) as exc:
+            raise E2.InputError("Measurement date must be YYYY-MM-DD.") from exc
+    if v.get("price_input", "direct") not in ("direct", "sale"):
+        raise E2.InputError("Choose direct price or sale conversion.")
+    if v.get("price_input") == "sale":
+        price = N.realized_price(v["sale_proceeds"], v["sale_mass"], v["price_basis"])
+        v.update(p_min=price, p_mode=price, p_max=price)
+        metadata["sale"] = {"proceeds_php": v["sale_proceeds"], "mass_g": v["sale_mass"]}
+    if v.get("fuel_input", "direct") not in ("direct", "liters × PHP/liter"):
+        raise E2.InputError("Choose direct fuel rates or liters × PHP/liter.")
+    if v.get("fuel_input") == "liters × PHP/liter":
+        fuel = N.fuel_cost(v["fuel_liters"], v["fuel_unit_price"], v["fuel_basis"])
+        v.update(fuel_min=fuel, fuel_mode=fuel, fuel_max=fuel)
+        metadata["fuel"] = {"liters": v["fuel_liters"], "php_per_liter": v["fuel_unit_price"], "basis": v["fuel_basis"]}
+    assay_mode = v.get("assay_mode", "unknown")
+    if assay_mode not in ("unknown", "PERT fraction", "measured value"):
+        raise E2.InputError("Choose unknown, PERT fraction or measured value for assay.")
+    if v["price_basis"] == "reference" and assay_mode == "unknown":
+        raise E2.InputError("Reference pricing requires physical purity.")
+    assay = None
+    if assay_mode == "measured value":
+        assay = N.purity_fraction(v["assay_value"], v["assay_unit"])
+        metadata["assay"] = {"value": v["assay_value"], "unit": v["assay_unit"]}
     numeric = ["s_m", "ya", "yb", "ym", "pi_J", "p_min", "p_mode", "p_max",
                "fixed_cost", "fixed_share", "W_opp", "hh_need"]
-    integers = [("n_c", 1)]
+    numeric += ["nonmining"]
+    integers = [("n_c", 1), ("n_hh", 0)]
+    if v.get("households_mode", "one per worker") not in ("one per worker", "explicit"):
+        raise E2.InputError("Choose default or explicit household count.")
     batch = v["timing_mode"] == "batch"
     if v["timing_mode"] not in ("batch", "fixed"):
         raise E2.InputError("Choose batch or fixed timing.")
@@ -167,7 +212,7 @@ def build_inputs(v: Dict[str, object], preset: Optional[str] = None) -> E2.Input
         numeric += [f"idle_{s}" for s in ("min", "mode", "max")]
         numeric += [f"h{d}_{s}" for d in (1, 2, 3) for s in ("min", "mode", "max")]
     else:
-        integers += [("D_c", 1), ("n_hh", 0)]
+        integers += [("D_c", 1)]
         numeric += ["h", "calendar_days", "nonmining"]
     for prefix in COST_FIELDS:
         numeric += [f"{prefix}_{s}" for s in ("min", "mode", "max", "share")]
@@ -179,7 +224,7 @@ def build_inputs(v: Dict[str, object], preset: Optional[str] = None) -> E2.Input
         raise E2.InputError("Choose a fixed zero probability or counts.")
     if E2.finite_number(v["pi_J"]) and v["pi_J"] > 0:
         numeric += ["jack_thr", "jack_cap", "jack_shape"]
-    if v["price_basis"] == "reference":
+    if assay_mode == "PERT fraction":
         numeric += ["q_min", "q_mode", "q_max"]
     if v["dependence"] == "copula":
         numeric += [key for _, _, key in correlation_keys()]
@@ -199,12 +244,17 @@ def build_inputs(v: Dict[str, object], preset: Optional[str] = None) -> E2.Input
     def pert(prefix):
         """Build a PERT from the `{prefix}_min/mode/max` widget values."""
         return E2.PERT(*(v[f"{prefix}_{s}"] for s in ("min", "mode", "max")))
+    if assay_mode == "PERT fraction":
+        assay = pert("q")
     timing = (E2.BatchTiming(pert("work"), pert("idle"), tuple(v[f"days_{d}"] for d in (1, 2, 3)),
                             {d: pert(f"h{d}") for d in (1, 2, 3)}) if batch else None)
     zero = E2.ZeroYield(p0=v["p0"]) if v["p0_mode"] == "fixed value" else E2.ZeroYield(z=v["z"], n=v["n_obs"])
     y = E2.PERT(v["ya"], v["ym"], v["yb"])
     jack = E2.Jackpot(v["jack_thr"], v["jack_cap"], v["jack_shape"]) if v["pi_J"] > 0 else None
-    costs = [E2.CostItem("fixed_operating", v["fixed_share"], fixed=v["fixed_cost"])]
+    components = [x.strip() for x in v.get("fixed_components", "").split(",") if x.strip()]
+    if v["fixed_cost"] > 0 and not components:
+        raise E2.InputError("Declare the component identifiers included in fixed overhead.")
+    costs = [E2.CostItem("fixed_operating", v["fixed_share"], fixed=v["fixed_cost"], components=components or None)]
     costs += [E2.CostItem(name, v[f"{prefix}_share"], pert=pert(prefix), basis=v[f"{prefix}_basis"])
               for prefix, name in COST_FIELDS.items()]
     rho = np.eye(len(COST_FIELDS))
@@ -221,22 +271,24 @@ def build_inputs(v: Dict[str, object], preset: Optional[str] = None) -> E2.Input
         n_c=v["n_c"], batch_timing=timing, D_c=1 if batch else v["D_c"],
         hours_per_worker_shift=8. if batch else v["h"], calendar_days_per_cycle=None if batch else v["calendar_days"],
         s_m=share, tribute_base=v["tribute_base"], yield_ord=y, zero=zero, pi_J=v["pi_J"], jackpot=jack,
-        price_basis=v["price_basis"], price=pert("p"), purity=pert("q") if v["price_basis"] == "reference" else 1.,
+        price_basis=v["price_basis"], price=pert("p"), purity=assay if v["price_basis"] == "reference" else 1.,
+        physical_purity=assay if v["price_basis"] == "farmgate" else None, metadata=metadata,
         costs=costs, equipment=equipment, dependence=v["dependence"], rho_spearman=rho.tolist(),
         reserve_mode=v.get("reserve_mode", "none"),
         reserve_location=None if v.get("reserve_location", "choose") == "choose" else v["reserve_location"],
         reserve_priority=None if v.get("reserve_priority", "choose") == "choose" else v["reserve_priority"],
         reserve_custom_per_cycle=v.get("reserve_custom", 0.),
         W_opp=v["W_opp"], W_opp_source=v.get("W_src", ""), W_opp_date=v.get("W_date", ""),
-        hh_need_per_household_day=v["hh_need"], n_households=None if batch or v["n_hh"] == 0 else v["n_hh"],
-        nonmining_income_per_household_day=0. if batch else v["nonmining"],
+        hh_need_per_household_day=v["hh_need"], n_households=None if v.get("households_mode", "one per worker") == "one per worker" else v["n_hh"],
+        nonmining_income_per_household_day=v["nonmining"],
         provenance=effective_tags(v, preset) if preset else {})
 
 
 def run_v2(v: Dict[str, object], preset: Optional[str] = None) -> Tuple[E2.Inputs, E2.Result]:
     """Build engine Inputs from UI values and run the V2 simulation."""
     inp = build_inputs(v, preset)
-    res = E2.run(inp, seed=v["seed"], tol=v["tol"], n_max=v["n_max"])
+    res = E2.run(inp, seed=v["seed"], tol=v["tol"], n_max=v["n_max"],
+                 return_abs_tol=v.get("return_abs_tol", 1.), return_rel_tol=v.get("return_rel_tol", .01))
     return inp, res
 
 
@@ -452,13 +504,21 @@ def fig_rank_sensitivity(rank: Dict[str, float]) -> plt.Figure:
 # --------------------------------------------------------------------------------------
 # Exports
 # --------------------------------------------------------------------------------------
-def export_csv(res: E2.Result, max_rows: int = 5_000) -> bytes:
+def export_csv(res: E2.Result, max_rows: int = 5_000, *, schema_version: int = 2) -> bytes:
     """Export per-cycle simulation arrays, including cash and reserve fields, as CSV bytes."""
+    if isinstance(schema_version, bool) or schema_version not in (1, 2):
+        raise E2.InputError("CSV schema_version must be 1 (legacy) or 2.")
+    if isinstance(max_rows, bool) or not isinstance(max_rows, int) or max_rows < 0:
+        raise E2.InputError("max_rows must be a nonnegative integer.")
     a = res.arrays
     m = min(max_rows, len(a["E"]))
     df = pd.DataFrame({
         "cycle_id": np.arange(1, m + 1),
-        "yield_g": a["Y"][:m], "purity_q": a["q"][:m], "price_php_per_g": a["P"][:m],
+        "yield_g": a["Y"][:m],
+        **({"purity_q": a["q"][:m]} if schema_version == 1 else
+           {"export_schema_version": 2, "valuation_multiplier": a["q"][:m],
+            "physical_purity_q": a["physical_purity_q"][:m] if "physical_purity_q" in a else np.full(m, np.nan)}),
+        "price_php_per_g": a["P"][:m],
         "miner_costs_php": a["C_eff"][:m], "miner_profit_php": a["Pi"][:m],
         **{key: a[key][:m] for key in E2.TIMING_KEYS if key in a},
         **{key: values[:m] for key, values in a.items() if key.startswith(("rate::", "cost::"))},
@@ -473,11 +533,15 @@ def export_csv(res: E2.Result, max_rows: int = 5_000) -> bytes:
     return df.to_csv(index=False).encode("utf-8")
 
 
-def export_manifest(res: E2.Result, extras: Optional[dict] = None) -> bytes:
+def export_manifest(res: E2.Result, extras: Optional[dict] = None, *, schema_version: int = 2) -> bytes:
     """Serialize the run manifest, summary and warnings (plus any `extras`) to JSON bytes."""
+    if isinstance(schema_version, bool) or schema_version not in (1, 2):
+        raise E2.InputError("Export schema must be 1 or 2.")
     doc = {"dashboard_version": DASHBOARD_VERSION, **res.manifest, "summary": E2._jsonable(res.summary),
-           "warnings": list(res.warnings), **(extras or {})}
-    return json.dumps(E2._jsonable(doc), indent=2, default=str).encode("utf-8")
+           "warnings": list(res.warnings), **(extras or {}), "export_schema_version": schema_version,
+           "purity_fields": {"physical_purity_q": "physical assay; blank when unknown", "valuation_multiplier": "revenue factor"}
+           if schema_version == 2 else {"purity_q": "legacy valuation multiplier, not necessarily physical assay"}}
+    return json.dumps(E2._jsonable(doc), indent=2, default=str, allow_nan=False).encode("utf-8")
 
 
 # --------------------------------------------------------------------------------------
@@ -518,7 +582,7 @@ LEGACY_FLAWS_MD = """
 
 ABOUT_MD = """
 ### Model scope and assumptions
-Every iteration represents a complete production batch. The crew attends every scheduled shift.
+Every iteration represents a complete production batch. The active crew attends every scheduled shift; partial attendance and changing membership are unsupported in batch mode.
 Working days follow discretized Beta-PERT; independent nonnegative idle days extend calendar time.
 Daily shift counts use the ten-day frequency grid; one conditional duration applies to all shifts that day.
 Batch yield is sampled directly and is independent of timing and valuation.
@@ -527,10 +591,30 @@ Expense rates describe the whole operation. The Gaussian copula links rates befo
 by operating exposure. Realized total-expense correlations can differ from the rate targets.
 Worksite food is additional consumption excluded from the household benchmark.
 
+Household counts are independent of active crew size; daily outside income reduces household needs,
+clipped at zero. All active contributors attend every scheduled shift.
 Hourly wage adequacy, household economic adequacy, and household cash adequacy are distinct.
 Economic profit includes depreciation; cash excludes it and accounts for funded reserves.
 The reserve is a single-batch allocation without accumulated balances or borrowing.
 
 All presets are synthetic demonstrations. Tests verify equations and software behavior;
 empirical validation requires independently obtained observations. External benchmarks need a source and date.
+Empirical fitting/resampling, fitted-parameter risk intervals, observed jackpot calibration and broader
+cross-input dependence remain deferred. Aggregate gross/net sharing has no reimbursements or full stakeholder ledger.
+Numerical error bounds and assumed-parameter scenario ranges do not establish predictive intervals.
 """
+
+
+def benchmark_sensitivity(res, inp):
+    """Threshold-only comparisons reuse the same economic draws, never resample."""
+    rows = []
+    for scale in (.8, 1., 1.2):
+        wage = inp.W_opp * scale
+        below = float(np.mean(res.arrays["E"] < wage))
+        for low, moderate in ((.60, .30), (.67, .34), (.75, .40)):
+            rows.append({"Wage (PHP/person-hour)": wage, "Wage factor": scale,
+                         "Low cutoff": low, "Moderate cutoff": moderate,
+                         "P_below_wage": below, "Illustrative band": E2.risk_band(1. - below, low, moderate),
+                         "Median wage yield (g)": float(np.median((res.arrays["C_eff"] + wage * res.arrays["L_person_hours"])
+                                                                     / (res.arrays["q"] * res.arrays["P"] * inp.s_m)))})
+    return pd.DataFrame(rows)

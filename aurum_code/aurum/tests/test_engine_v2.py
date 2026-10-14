@@ -332,11 +332,12 @@ class TestConvergenceAndReproducibility(unittest.TestCase):
         """The staged-N stability table has the expected stages, valid probabilities, and shrinking MCSE."""
         r = run(base(), n_fixed=100_000)
         t = r.stage_table
-        self.assertEqual(list(t["N"]), [1_000, 10_000, 50_000, 100_000])
+        self.assertEqual(list(t["N"]), [1_000] + list(range(10_000, 100_001, 5_000)))
         for k in E2.PROB_KEYS:
             self.assertTrue(((t[k] >= 0) & (t[k] <= 1)).all())
             self.assertTrue(t[f"MCSE_{k}"].is_monotonic_decreasing)
-            a, b = t.iloc[2], t.iloc[3]                              # 50k vs 100k should agree
+            a = t.loc[t['N'] == 50_000].iloc[0]
+            b = t.loc[t['N'] == 100_000].iloc[0]
             self.assertLess(abs(a[k] - b[k]), 5 * a[f"MCSE_{k}"])
 
     def test_manifest_survives_missing_file_attribute(self):
