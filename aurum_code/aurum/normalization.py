@@ -3,6 +3,7 @@ from engine_v2 import InputError, finite_number, COST_BASES
 
 
 def _number(name, value, positive=False):
+    """Coerce `value` to a finite float, raising InputError if it fails the positive/nonnegative check."""
     if not finite_number(value) or (value <= 0 if positive else value < 0):
         raise InputError(f"{name}: must be finite and {'positive' if positive else 'nonnegative'}.")
     return float(value)

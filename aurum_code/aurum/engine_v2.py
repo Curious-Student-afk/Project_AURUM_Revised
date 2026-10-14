@@ -924,6 +924,7 @@ RETURN_KEYS = ("E_mean", "E_median", "E_P5", "E_P95", "E_expected_shortfall_5pct
 
 
 def _validate_return_tolerances(abs_tol, rel_tol):
+    """Raise InputError unless both return tolerances are finite, nonnegative and at least one is positive."""
     errs = []
     for key, value in (("return_abs_tol", abs_tol), ("return_rel_tol", rel_tol)):
         if require_finite(key, value, errs) and value < 0:
