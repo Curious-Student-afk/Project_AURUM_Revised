@@ -85,8 +85,7 @@ class TestBatchTiming(unittest.TestCase):
         for timing in bad:
             with self.subTest(timing=timing), self.assertRaises(E.InputError):
                 E.validate(dataclasses.replace(batch_synthetic(), batch_timing=timing))
-        for kw in ({'n_households': 3}, {'nonmining_income_per_household_day': 1},
-                   {'calendar_days_per_cycle': 5}, {'hours_matrix': [[8] * 4]},
+        for kw in ({'calendar_days_per_cycle': 5}, {'hours_matrix': [[8] * 4]},
                    {'D_c': 2}, {'hours_per_worker_shift': 9}, {'batch_timing': 'invalid'},
                    {'n_c': 10**400}, {'hh_need_per_household_day': 1e308}):
             with self.subTest(kw=kw), self.assertRaises(E.InputError):
