@@ -358,11 +358,9 @@ def main(argv=None) -> None:
     run_kwargs = {"seed": a.seed, **({"n_fixed": 20_000} if a.quick else {"n_max": a.n_cap})}
     inventory_runs = []
     t_all = time.time()
-    run_settings = {"quick_mode": a.quick, "seed": a.seed, "n_cap": a.n_cap, "spot": a.spot,
-                    "spot_low": lo, "spot_high": hi, "data_freeze": DATA_FREEZE}
     for i, item in enumerate(plan, 1):
         row_path, man_path = out / "rows" / f"{item['run_id']}.json", out / "manifests" / f"{item['run_id']}.json"
-                if (
+        if (
             a.resume
             and row_path.exists()
             and man_path.exists()
