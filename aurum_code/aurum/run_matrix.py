@@ -290,7 +290,8 @@ def freeze_check(expected: str, out_name: str) -> dict:
         head = git("rev-parse", "HEAD").strip()
         status = [ln for ln in git("status", "--porcelain").splitlines()
                   if "run_matrix.py" not in ln and out_name not in ln and "__pycache__" not in ln]
-        info.update(git_revision=head, matches_expected=(head == expected), other_dirty_files=status, verified=True)
+        info.update(git_revision=head, matches_expected=(head == expected),
+                    other_dirty_files=status, verified=True)
     except (OSError, subprocess.SubprocessError):
         pass
     return info
@@ -323,7 +324,7 @@ def main(argv=None) -> None:
     wanted = {b.strip() for b in a.blocks.split(",") if b.strip()}
     unknown = wanted - {p["block"] for p in plan}
     if unknown:
-        ap.error(f"unknown block IDs: {', '.join(sorted(unknown))}")
+        sys.exit(f"Unknown block id(s): {', '.join(sorted(unknown))}")
     if wanted:
         plan = [p for p in plan if p["block"] in wanted]
     if a.list:
@@ -337,7 +338,9 @@ def main(argv=None) -> None:
         (out / sub).mkdir(parents=True, exist_ok=True)
     check = freeze_check(a.expect_git, out.name)
     print("Freeze check:", json.dumps(check))
-    if not check["verified"] or check["matches_expected"] is not True or check["other_dirty_files"]:
+    if (check["verified"] is not True
+            or check["matches_expected"] is not True
+            or check["other_dirty_files"]):
         msg = "Frozen-code check failed (Git state could not be verified, HEAD differs from expected, or files other than run_matrix.py are modified)."
         if not a.force:
             sys.exit(msg + " Re-run with --force to proceed anyway.")
@@ -355,9 +358,12 @@ def main(argv=None) -> None:
     run_kwargs = {"seed": a.seed, **({"n_fixed": 20_000} if a.quick else {"n_max": a.n_cap})}
     inventory_runs = []
     t_all = time.time()
+    run_settings = {"quick_mode": a.quick, "seed": a.seed, "n_cap": a.n_cap, "spot": a.spot,
+                    "spot_low": lo, "spot_high": hi, "data_freeze": DATA_FREEZE}
     for i, item in enumerate(plan, 1):
         row_path, man_path = out / "rows" / f"{item['run_id']}.json", out / "manifests" / f"{item['run_id']}.json"
-        if a.resume and row_path.exists() and man_path.exists():
+        if (a.resume and row_path.exists() and man_path.exists()
+                and json.loads(row_path.read_text()).get("run_settings") == run_settings):
             if json.loads(row_path.read_text()).get("run_settings") == run_settings:
                 print(f"[{i}/{len(plan)}] {item['run_id']}: skipped (resume)")
                 continue
@@ -365,6 +371,7 @@ def main(argv=None) -> None:
         res = E.run(item["inp"], **run_kwargs)
         wall = time.time() - t0
         row = result_row(res, item, wall)
+        row["run_settings"] = run_settings
         row["run_settings"] = run_settings
         extras = {"run_id": item["run_id"], "block": item["block"], "factors": item["factors"], "matrix_version": MATRIX_VERSION,
                   "quick_mode": a.quick, "data_freeze": DATA_FREEZE}
@@ -377,15 +384,25 @@ def main(argv=None) -> None:
 
     rows = []
     for p in plan:
-        rp = out / "rows" / f"{p['run_id']}.json"
-        if rp.exists():
-            row = json.loads(rp.read_text())
-            if row.get("run_settings") != run_settings:
-                continue
-            rows.append(row)
-            inventory_runs.append({"run_id": p["run_id"], "block": p["block"], "label": p["label"],
-                                   "manifest": f"manifests/{p['run_id']}.json", "inputs_sha256": rows[-1]["inputs_sha256"],
-                                   "N": rows[-1]["N"], "converged": rows[-1]["converged"]})
+    rp = out / "rows" / f"{p['run_id']}.json"
+    if rp.exists():
+        saved_row = json.loads(rp.read_text())
+        
+        # CodeRabbit's exact logic: Skip the file if settings don't match or don't exist
+        if saved_row.get("run_settings") != run_settings:
+            continue
+            
+        rows.append(saved_row)
+        inventory_runs.append({
+            "run_id": p["run_id"], 
+            "block": p["block"], 
+            "label": p["label"],
+            "manifest": f"manifests/{p['run_id']}.json", 
+            "inputs_sha256": saved_row["inputs_sha256"],
+            "N": saved_row["N"], 
+            "converged": saved_row["converged"]
+        })
+
     df = pd.DataFrame(rows)
     df.to_csv(out / "matrix_results.csv", index=False)
     heatmap(df, out)
