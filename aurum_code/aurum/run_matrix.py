@@ -123,10 +123,12 @@ def mode_fractions(inp: E.Inputs):
 # Run plan
 # --------------------------------------------------------------------------------------
 def build_plan(spot_ref: float, spot_low: float, spot_high: float):
+    """Return M0-M10 run specifications using reference, low, and high spot prices."""
     base = base_inputs(spot_ref)
     plan = []
 
     def add(block, rid, label, inp, **factors):
+        """Append a run with a block-prefixed ID, inputs, and sensitivity factors."""
         plan.append({"block": block, "run_id": f"{block}_{rid}", "label": label, "inp": inp, "factors": factors})
 
     add("M0", "baseline", "Baseline-External, gross, s_m=0.50", base)
@@ -198,6 +200,7 @@ def build_plan(spot_ref: float, spot_low: float, spot_high: float):
 # Results
 # --------------------------------------------------------------------------------------
 def result_row(res: E.Result, item: dict, wall: float) -> dict:
+    """Return a JSON-compatible row of run factors, statistics, diagnostics, and elapsed seconds."""
     s, a, m = res.summary, res.arrays, res.manifest
     row = {"run_id": item["run_id"], "block": item["block"], "label": item["label"],
            **{f"factor_{k}": v for k, v in item["factors"].items()},
@@ -221,6 +224,7 @@ def result_row(res: E.Result, item: dict, wall: float) -> dict:
 
 
 def save_m0_extras(res: E.Result, inp: E.Inputs, out: Path) -> None:
+    """Write baseline diagnostic tables and up to 5,000 cycles as CSVs under out/M0."""
     d = out / "M0"
     d.mkdir(exist_ok=True)
     DL.thresholds_table(res).to_csv(d / "thresholds.csv", index=False)
@@ -235,6 +239,7 @@ def save_m0_extras(res: E.Result, inp: E.Inputs, out: Path) -> None:
 
 
 def heatmap(df: pd.DataFrame, out: Path) -> None:
+    """Save M2 probability grids as CSVs and a PNG heatmap; skip when no M2 rows exist."""
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
@@ -274,6 +279,10 @@ def heatmap(df: pd.DataFrame, out: Path) -> None:
 # Freeze check and inventory
 # --------------------------------------------------------------------------------------
 def freeze_check(expected: str, out_name: str) -> dict:
+    """Report revision agreement and dirtiness, excluding runner, output, and bytecode paths.
+
+    Git fields remain None when repository information cannot be read.
+    """
     info = {"expected_git": expected, "git_revision": None, "matches_expected": None, "other_dirty_files": None}
     try:
         git = lambda *a: subprocess.check_output(["git", *a], cwd=HERE, text=True, stderr=subprocess.DEVNULL, timeout=10)
@@ -287,6 +296,10 @@ def freeze_check(expected: str, out_name: str) -> dict:
 
 
 def main(argv=None) -> None:
+    """Parse CLI arguments to list or execute the matrix and export results and inventory.
+
+    Read arguments from sys.argv when argv is None, and run M11 if requested.
+    """
     ap = argparse.ArgumentParser(description="Project AURUM results matrix runner")
     ap.add_argument("--out", default="matrix_out")
     ap.add_argument("--seed", type=int, default=42)
