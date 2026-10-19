@@ -281,15 +281,16 @@ def heatmap(df: pd.DataFrame, out: Path) -> None:
 def freeze_check(expected: str, out_name: str) -> dict:
     """Report revision agreement and dirtiness, excluding runner, output, and bytecode paths.
 
-    Git fields remain None when repository information cannot be read.
+    Verification succeeds only after both HEAD and status have been read.
     """
-    info = {"expected_git": expected, "git_revision": None, "matches_expected": None, "other_dirty_files": None}
+    info = {"expected_git": expected, "git_revision": None, "matches_expected": None,
+            "other_dirty_files": None, "verified": False}
     try:
         git = lambda *a: subprocess.check_output(["git", *a], cwd=HERE, text=True, stderr=subprocess.DEVNULL, timeout=10)
         head = git("rev-parse", "HEAD").strip()
         status = [ln for ln in git("status", "--porcelain").splitlines()
                   if "run_matrix.py" not in ln and out_name not in ln and "__pycache__" not in ln]
-        info.update(git_revision=head, matches_expected=(head == expected), other_dirty_files=status)
+        info.update(git_revision=head, matches_expected=(head == expected), other_dirty_files=status, verified=True)
     except (OSError, subprocess.SubprocessError):
         pass
     return info
@@ -320,6 +321,9 @@ def main(argv=None) -> None:
     lo, hi = min(lo, a.spot), max(hi, a.spot)
     plan = build_plan(a.spot, lo, hi)
     wanted = {b.strip() for b in a.blocks.split(",") if b.strip()}
+    unknown = wanted - {p["block"] for p in plan}
+    if unknown:
+        ap.error(f"unknown block IDs: {', '.join(sorted(unknown))}")
     if wanted:
         plan = [p for p in plan if p["block"] in wanted]
     if a.list:
@@ -333,26 +337,35 @@ def main(argv=None) -> None:
         (out / sub).mkdir(parents=True, exist_ok=True)
     check = freeze_check(a.expect_git, out.name)
     print("Freeze check:", json.dumps(check))
-    if check["matches_expected"] is False or check["other_dirty_files"]:
-        msg = "Frozen-code check failed (HEAD differs from expected, or files other than run_matrix.py are modified)."
+    if not check["verified"] or check["matches_expected"] is not True or check["other_dirty_files"]:
+        msg = "Frozen-code check failed (Git state could not be verified, HEAD differs from expected, or files other than run_matrix.py are modified)."
         if not a.force:
             sys.exit(msg + " Re-run with --force to proceed anyway.")
         print("WARNING:", msg)
     if a.quick:
         print("QUICK MODE: 20,000 draws per run. Do not report these results.")
 
+    run_settings = {
+        "matrix_version": MATRIX_VERSION, "quick_mode": a.quick, "seed": a.seed, "n_cap": a.n_cap,
+        "data_freeze": {"date": DATA_FREEZE, "S_php_per_g": a.spot, "S_source": S_SOURCE, "spot_low": lo, "spot_high": hi,
+                        "spot_range_note": "6-month range as of 2026-07-31 unless overridden; re-pull to the freeze date",
+                        "f_pert": list(F_PERT), "W_opp": W_OPP, "W_source": W_SOURCE, "W_date": W_DATE,
+                        "household_need": HH_NEED, "food_pert": list(FOOD)},
+    }
     run_kwargs = {"seed": a.seed, **({"n_fixed": 20_000} if a.quick else {"n_max": a.n_cap})}
     inventory_runs = []
     t_all = time.time()
     for i, item in enumerate(plan, 1):
         row_path, man_path = out / "rows" / f"{item['run_id']}.json", out / "manifests" / f"{item['run_id']}.json"
         if a.resume and row_path.exists() and man_path.exists():
-            print(f"[{i}/{len(plan)}] {item['run_id']}: skipped (resume)")
-            continue
+            if json.loads(row_path.read_text()).get("run_settings") == run_settings:
+                print(f"[{i}/{len(plan)}] {item['run_id']}: skipped (resume)")
+                continue
         t0 = time.time()
         res = E.run(item["inp"], **run_kwargs)
         wall = time.time() - t0
         row = result_row(res, item, wall)
+        row["run_settings"] = run_settings
         extras = {"run_id": item["run_id"], "block": item["block"], "factors": item["factors"], "matrix_version": MATRIX_VERSION,
                   "quick_mode": a.quick, "data_freeze": DATA_FREEZE}
         man_path.write_bytes(DL.export_manifest(res, extras))
@@ -366,7 +379,10 @@ def main(argv=None) -> None:
     for p in plan:
         rp = out / "rows" / f"{p['run_id']}.json"
         if rp.exists():
-            rows.append(json.loads(rp.read_text()))
+            row = json.loads(rp.read_text())
+            if row.get("run_settings") != run_settings:
+                continue
+            rows.append(row)
             inventory_runs.append({"run_id": p["run_id"], "block": p["block"], "label": p["label"],
                                    "manifest": f"manifests/{p['run_id']}.json", "inputs_sha256": rows[-1]["inputs_sha256"],
                                    "N": rows[-1]["N"], "converged": rows[-1]["converged"]})
@@ -380,10 +396,7 @@ def main(argv=None) -> None:
         "matrix_version": MATRIX_VERSION, "created_utc": datetime.now(timezone.utc).isoformat(timespec="seconds"),
         "quick_mode": a.quick, "seed": a.seed, "n_cap": a.n_cap, "blocks": sorted({p["block"] for p in plan}),
         "n_runs_planned": len(plan), "n_runs_with_results": len(rows), "n_unconverged": int(len(unconverged)),
-        "data_freeze": {"date": DATA_FREEZE, "S_php_per_g": a.spot, "S_source": S_SOURCE, "spot_low": lo, "spot_high": hi,
-                        "spot_range_note": "6-month range as of 2026-07-31 unless overridden; re-pull to the freeze date",
-                        "f_pert": list(F_PERT), "W_opp": W_OPP, "W_source": W_SOURCE, "W_date": W_DATE,
-                        "household_need": HH_NEED, "food_pert": list(FOOD)},
+        "data_freeze": run_settings["data_freeze"],
         "freeze_check": check, "code_identity": E.source_identity(),
         "runtime": {"python": platform.python_version(), "numpy": np.__version__, "pandas": pd.__version__,
                     "scipy": __import__("scipy").__version__},
