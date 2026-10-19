@@ -362,16 +362,18 @@ def main(argv=None) -> None:
                     "spot_low": lo, "spot_high": hi, "data_freeze": DATA_FREEZE}
     for i, item in enumerate(plan, 1):
         row_path, man_path = out / "rows" / f"{item['run_id']}.json", out / "manifests" / f"{item['run_id']}.json"
-        if (a.resume and row_path.exists() and man_path.exists()
-                and json.loads(row_path.read_text()).get("run_settings") == run_settings):
-            if json.loads(row_path.read_text()).get("run_settings") == run_settings:
-                print(f"[{i}/{len(plan)}] {item['run_id']}: skipped (resume)")
-                continue
+                if (
+            a.resume
+            and row_path.exists()
+            and man_path.exists()
+            and json.loads(row_path.read_text()).get("run_settings") == run_settings
+        ):
+            print(f"[{i}/{len(plan)}] {item['run_id']}: skipped (resume)")
+            continue
         t0 = time.time()
         res = E.run(item["inp"], **run_kwargs)
         wall = time.time() - t0
         row = result_row(res, item, wall)
-        row["run_settings"] = run_settings
         row["run_settings"] = run_settings
         extras = {"run_id": item["run_id"], "block": item["block"], "factors": item["factors"], "matrix_version": MATRIX_VERSION,
                   "quick_mode": a.quick, "data_freeze": DATA_FREEZE}
@@ -384,24 +386,22 @@ def main(argv=None) -> None:
 
     rows = []
     for p in plan:
-    rp = out / "rows" / f"{p['run_id']}.json"
-    if rp.exists():
-        saved_row = json.loads(rp.read_text())
-        
-        # CodeRabbit's exact logic: Skip the file if settings don't match or don't exist
-        if saved_row.get("run_settings") != run_settings:
-            continue
-            
-        rows.append(saved_row)
-        inventory_runs.append({
-            "run_id": p["run_id"], 
-            "block": p["block"], 
-            "label": p["label"],
-            "manifest": f"manifests/{p['run_id']}.json", 
-            "inputs_sha256": saved_row["inputs_sha256"],
-            "N": saved_row["N"], 
-            "converged": saved_row["converged"]
-        })
+        rp = out / "rows" / f"{p['run_id']}.json"
+        if rp.exists():
+            saved_row = json.loads(rp.read_text())
+            if saved_row.get("run_settings") != run_settings:
+                continue
+
+            rows.append(saved_row)
+            inventory_runs.append({
+                "run_id": p["run_id"],
+                "block": p["block"],
+                "label": p["label"],
+                "manifest": f"manifests/{p['run_id']}.json",
+                "inputs_sha256": saved_row["inputs_sha256"],
+                "N": saved_row["N"],
+                "converged": saved_row["converged"],
+            })
 
     df = pd.DataFrame(rows)
     df.to_csv(out / "matrix_results.csv", index=False)
